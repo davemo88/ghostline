@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GHOSTLINE</title>
+    <style>
+      :root {
+        --you: #39e0d0;
+        --enemy: #ff8a3d;
+        --neutral: #d05ce0;
+        --bg: #101318;
+        --panel: rgba(16, 22, 28, 0.88);
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: var(--bg);
+        color: #cfe8e5;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 13px;
+        user-select: none;
+      }
+      #app {
+        position: fixed;
+        inset: 0;
+      }
+      .holo {
+        background: var(--panel);
+        border: 1px solid rgba(57, 224, 208, 0.35);
+        box-shadow: 0 0 12px rgba(57, 224, 208, 0.12);
+        border-radius: 3px;
+      }
+      #topbar {
+        position: fixed;
+        top: 8px;
+        left: 50%;
+        transform: translateX(-50%);
+        padding: 6px 14px;
+        white-space: pre;
+        z-index: 10;
+      }
+      #uplink {
+        position: fixed;
+        top: 44px;
+        left: 50%;
+        transform: translateX(-50%);
+        padding: 3px 12px;
+        color: var(--enemy);
+        border-color: rgba(255, 138, 61, 0.5);
+        display: none;
+        z-index: 10;
+      }
+      #events {
+        position: fixed;
+        top: 8px;
+        right: 8px;
+        width: 300px;
+        padding: 6px 10px;
+        color: #8fb8b2;
+        z-index: 10;
+        pointer-events: none;
+      }
+      #events div {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      #buildbar {
+        position: fixed;
+        bottom: 8px;
+        left: 50%;
+        transform: translateX(-50%);
+        display: flex;
+        gap: 6px;
+        padding: 6px;
+        z-index: 10;
+      }
+      #buildbar button,
+      #panel button {
+        background: rgba(57, 224, 208, 0.08);
+        color: var(--you);
+        border: 1px solid rgba(57, 224, 208, 0.4);
+        border-radius: 2px;
+        font: inherit;
+        padding: 5px 9px;
+        cursor: pointer;
+      }
+      #buildbar button:hover,
+      #panel button:hover {
+        background: rgba(57, 224, 208, 0.22);
+      }
+      #panel button.active {
+        background: rgba(57, 224, 208, 0.35);
+        color: #06201d;
+      }
+      #panel {
+        position: fixed;
+        bottom: 8px;
+        left: 8px;
+        min-width: 240px;
+        padding: 8px 10px;
+        z-index: 10;
+        display: none;
+      }
+      #panel h3 {
+        margin: 0 0 6px;
+        font-size: 13px;
+        color: var(--you);
+      }
+      #panel .row {
+        margin: 4px 0;
+        display: flex;
+        gap: 4px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+      #minimap {
+        position: fixed;
+        bottom: 8px;
+        right: 8px;
+        width: 200px;
+        height: 200px;
+        z-index: 10;
+        cursor: crosshair;
+      }
+      #intel {
+        position: fixed;
+        top: 8px;
+        left: 8px;
+        width: 340px;
+        max-height: calc(100vh - 120px);
+        overflow-y: auto;
+        padding: 8px 10px;
+        z-index: 10;
+        display: none;
+        font-size: 11px;
+        line-height: 1.45;
+        border-color: rgba(255, 138, 61, 0.45);
+      }
+      #intel h4 {
+        margin: 8px 0 2px;
+        color: var(--enemy);
+        font-size: 11px;
+      }
+      #intel .think {
+        color: #9aa7b8;
+        font-style: italic;
+        white-space: pre-wrap;
+      }
+      #intel .memo {
+        color: #ffc9a3;
+        white-space: pre-wrap;
+      }
+      #intel .cmd {
+        color: #7fd8d0;
+      }
+      #intel .rej {
+        color: #ff6d6d;
+      }
+      #overlay {
+        position: fixed;
+        inset: 0;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        background: rgba(6, 8, 10, 0.7);
+        z-index: 20;
+        font-size: 34px;
+        letter-spacing: 6px;
+      }
+      #help {
+        position: fixed;
+        bottom: 224px;
+        right: 8px;
+        width: 200px;
+        padding: 6px 8px;
+        color: #4a6a66;
+        font-size: 11px;
+        z-index: 10;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div id="topbar" class="holo">—</div>
+    <div id="uplink" class="holo">⟨ UPLINK — opponent thinking ⟩</div>
+    <div id="events" class="holo"></div>
+    <div id="buildbar" class="holo"></div>
+    <div id="panel" class="holo"></div>
+    <div id="intel" class="holo"></div>
+    <canvas id="minimap" class="holo" width="200" height="200"></canvas>
+    <div id="help" class="holo">
+      right-click: move commander · click building: panel · B or buttons: build ·
+      arrows/edge/minimap: camera · wheel: zoom · space: to commander (2x follow) ·
+      K: play vs Claude · M: Claude's thoughts · X: fog · P: pause · Esc: cancel
+    </div>
+    <div id="overlay"></div>
+    <div id="errbox" style="position:fixed;left:8px;top:8px;max-width:44vw;color:#ff6d6d;z-index:99;white-space:pre-wrap;font-size:11px;"></div>
+    <script>
+      // Dev aid: surface uncaught errors on the page (headless screenshots
+      // have no console).
+      window.addEventListener('error', (e) => {
+        document.getElementById('errbox').textContent += `${e.message}\n  ${(e.error && e.error.stack || '').split('\n')[1] || ''}\n`;
+      });
+      window.addEventListener('unhandledrejection', (e) => {
+        document.getElementById('errbox').textContent += `unhandled: ${e.reason}\n`;
+      });
+      if (location.search.includes('snap')) {
+        // hold the load event open so headless screenshots capture a live frame
+        const ms = Number(new URLSearchParams(location.search).get('snap') || 3000) + 1500;
+        document.write('<img src="/delay?ms=' + ms + '" style="display:none" alt="">');
+      }
+    </script>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

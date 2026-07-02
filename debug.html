@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GHOSTLINE — sim debugger</title>
+    <style>
+      body {
+        margin: 0;
+        background: #14161a;
+        color: #7fd8d0;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 12px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+      }
+      #hud {
+        padding: 6px 10px;
+        white-space: pre;
+      }
+      #help {
+        padding: 4px 10px;
+        color: #4a6a66;
+      }
+      canvas {
+        image-rendering: pixelated;
+        border: 1px solid #2a3238;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="hud">—</div>
+    <canvas id="view" width="900" height="900"></canvas>
+    <div id="help">
+      right-click: move commander · E extractor · F fabricator · W watchtower · S spire · A aegis (at cursor)
+      · 1-4 set hovered fabricator unit (ronin/oni/mantis/wasp) · G guard H hold U assault N hunt (hovered fab)
+      · Y set rally of hovered fab to cursor on next click · R research next eco · T research next mil · C research next cmd
+      · O global override fall_back · D override defend · L release · X toggle fog · P pause
+      · K toggle Claude opponent (asks for API key once; sim pauses on an "uplink" while Claude thinks)
+    </div>
+    <script type="module" src="/src/debug.ts"></script>
+  </body>
+</html>

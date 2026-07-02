@@ -1,0 +1,6 @@
+node_modules/
+dist/
+replays/
+*.log
+.DS_Store
+.claude/settings.local.json
