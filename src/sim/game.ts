@@ -43,6 +43,7 @@ import {
   TICKS_PER_SECOND,
   type TechId,
   UNIT_STATS,
+  WAVE_INTERVAL,
   type UnitType,
   VEIL_STILL_SECONDS,
   VISION_INTERVAL,
@@ -121,6 +122,7 @@ export interface BuildingEnt {
   rally: Vec;
   behavior: Behavior;
   prodTicksLeft: number; // -1 = idle (waiting for energy)
+  ready: UnitType | null; // finished unit holding in the bay for the next wave
   targetId: number; // watchtower current target
 }
 
@@ -177,6 +179,19 @@ interface Attack {
   dmg: number; // mHP
   attackerDesc: string; // for kill events, e.g. "enemy oni"
   attackerPos: Vec;
+  attackerType: UnitType | 'watchtower';
+  attackerPlayer: PlayerId;
+  attackerId: number;
+}
+
+/** One resolved attack, for presentation (tracers/impact flashes). Not part of the hash. */
+export interface AttackEvent {
+  from: Vec;
+  to: Vec;
+  targetId: number;
+  attackerId: number;
+  attackerType: UnitType | 'watchtower';
+  player: PlayerId;
 }
 
 const INTERACT_RANGE_MU = Math.floor(COMMANDER.interactRange * FP);
@@ -198,6 +213,10 @@ export class Game {
   winReason: string | null = null; // what killed the losing commander (balance metrics)
   /** Every accepted command with its tick — deterministic replay = seed + this log. */
   commandLog: { tick: number; player: PlayerId; cmd: Command }[] = [];
+  /** Attacks resolved in the most recent step; rewritten each tick (presentation only). */
+  attackLog: AttackEvent[] = [];
+  /** Debug cheat: placed buildings complete instantly. Toggling mid-match breaks replay parity. */
+  debugInstantBuild = false;
 
   constructor(seed: number, map?: GameMap) {
     this.seed = seed;
@@ -293,6 +312,7 @@ export class Game {
       rally: { ...pos },
       behavior: 'guard',
       prodTicksLeft: -1,
+      ready: null,
       targetId: 0,
     };
     this.entities.set(b.id, b);
@@ -536,6 +556,12 @@ export class Game {
         if (p.energy < cost) return fail('insufficient energy');
         p.energy -= cost;
         const b = this.addBuilding(player, c.type, pos);
+        if (this.debugInstantBuild) {
+          b.buildTicks = b.buildTicksNeeded;
+          b.done = true;
+          b.hp = b.maxHp;
+          return;
+        }
         cmdr.tasks.push({ kind: 'build', building: b.id });
         return;
       }
@@ -801,7 +827,11 @@ export class Game {
       case 'build': {
         if (b.done) return void done();
         c.channeling = true;
-        const rate = p.techs.has('cmd1') ? SERVO_BUILD_RATE : 1000;
+        const rate = this.debugInstantBuild
+          ? b.buildTicksNeeded // debug cheat: one channel tick finishes anything
+          : p.techs.has('cmd1')
+            ? SERVO_BUILD_RATE
+            : 1000;
         b.buildTicks += rate;
         if (b.buildTicks >= b.buildTicksNeeded) {
           b.done = true;
@@ -932,10 +962,22 @@ export class Game {
   // -- production ----------------------------------------------------------------
 
   private tickProduction(): void {
+    // All fabricators deploy on a shared wave cycle: production runs on its own
+    // timer, but the finished unit holds in the bay until the next wave tick.
+    // (Build times exceed WAVE_INTERVAL, so at most one unit waits per bay.)
+    const waveNow = this.tick % (WAVE_INTERVAL * TICKS_PER_SECOND) === 0;
     for (const b of [...this.buildings()]) {
-      if (b.type !== 'fabricator' || !b.done || !b.on) continue;
+      if (b.type !== 'fabricator' || !b.done) continue;
+      if (waveNow && b.ready !== null) {
+        // deploy even if production was since switched off — the unit is paid for
+        const type = b.ready;
+        b.ready = null;
+        this.spawnUnit(b.player, type, b);
+      }
+      if (!b.on) continue;
       const p = this.players[b.player];
       if (b.prodTicksLeft < 0) {
+        if (b.ready !== null) continue; // bay occupied — wait for the wave
         const cost = UNIT_STATS[b.production].cost * FP;
         if (p.energy >= cost) {
           p.energy -= cost;
@@ -943,7 +985,7 @@ export class Game {
         }
       } else if (--b.prodTicksLeft <= 0) {
         b.prodTicksLeft = -1;
-        this.spawnUnit(b.player, b.production, b);
+        b.ready = b.production; // paid + built as this type; wave releases it
       }
     }
   }
@@ -1041,12 +1083,19 @@ export class Game {
     if (target) {
       const d2 = dist2(u.pos, target.pos);
       if (d2 <= rangeMu * rangeMu) {
-        attacks.push({
-          targetId: target.id,
-          dmg: this.computeDamage(u, target),
-          attackerDesc: `enemy ${u.type}`,
-          attackerPos: u.pos,
-        });
+        // burst weapons volley every burstTicks (staggered per unit id), dps preserved
+        const cycle = Math.max(1, Math.round(UNIT_STATS[u.type].burstTicks ?? 1));
+        if ((this.tick + u.id) % cycle === 0) {
+          attacks.push({
+            targetId: target.id,
+            dmg: this.computeDamage(u, target) * cycle,
+            attackerDesc: `enemy ${u.type}`,
+            attackerPos: u.pos,
+            attackerType: u.type,
+            attackerPlayer: u.player,
+            attackerId: u.id,
+          });
+        }
       } else if (behavior !== 'hold') {
         // Chase (repath periodically or when the target strays from our path goal).
         if (!u.pathGoal || dist2(u.pathGoal, target.pos) > 4 * FP * FP || (this.tick + u.id) % 10 === 0) {
@@ -1240,7 +1289,15 @@ export class Game {
         let dmg = BUILDING_STATS.watchtower.dps! * 100;
         if (this.elevAt(b.pos) > this.elevAt(target.pos)) dmg = pm(dmg, HIGH_GROUND_DAMAGE);
         dmg = pm(dmg, this.damageTakenMult(target));
-        attacks.push({ targetId: target.id, dmg, attackerDesc: 'enemy watchtower', attackerPos: b.pos });
+        attacks.push({
+          targetId: target.id,
+          dmg,
+          attackerDesc: 'enemy watchtower',
+          attackerPos: b.pos,
+          attackerType: 'watchtower',
+          attackerPlayer: b.player,
+          attackerId: b.id,
+        });
       }
     }
   }
@@ -1248,9 +1305,18 @@ export class Game {
   // -- damage -------------------------------------------------------------------
 
   private applyAttacks(attacks: Attack[]): void {
+    this.attackLog = [];
     for (const a of attacks) {
       const t = this.entities.get(a.targetId);
       if (!t) continue;
+      this.attackLog.push({
+        from: { ...a.attackerPos },
+        to: { ...t.pos },
+        targetId: t.id,
+        attackerId: a.attackerId,
+        attackerType: a.attackerType,
+        player: a.attackerPlayer,
+      });
       t.hp -= a.dmg;
       if (t.kind === 'commander') {
         t.lastDamageTick = this.tick;
@@ -1428,7 +1494,7 @@ export class Game {
       if (e.kind === 'commander') {
         return ['c', e.id, e.player, e.pos.x, e.pos.y, e.hp, e.tasks.length, e.stillTicks];
       }
-      return ['b', e.id, e.player, e.type, e.pos.x, e.pos.y, e.hp, e.done ? 1 : 0, e.buildTicks, e.prodTicksLeft, e.on ? 1 : 0];
+      return ['b', e.id, e.player, e.type, e.pos.x, e.pos.y, e.hp, e.done ? 1 : 0, e.buildTicks, e.prodTicksLeft, e.ready ?? '', e.on ? 1 : 0];
     });
     const players = this.players.map((p) => [
       p.energy,

@@ -7,12 +7,17 @@ import {
   type Behavior,
   type BuildingEnt,
   type BuildingType,
+  COUNTER,
   type Command,
+  type CommanderEnt,
   FP,
   type Game,
   TECHS,
   type TechId,
+  TICKS_PER_SECOND,
+  UNIT_STATS,
   type UnitType,
+  WAVE_INTERVAL,
   availableTechs,
   cellIndex,
 } from '../sim';
@@ -20,14 +25,41 @@ import type { Terrain } from '../render/terrain';
 import type { TurnRecord } from '../claude/driver';
 
 const BUILDABLE: { type: BuildingType; key: string; label: string }[] = [
-  { type: 'extractor', key: 'E', label: 'extractor' },
-  { type: 'fabricator', key: 'F', label: 'fabricator' },
-  { type: 'watchtower', key: 'W', label: 'watchtower' },
-  { type: 'sensor_spire', key: 'S', label: 'spire' },
-  { type: 'aegis_projector', key: 'A', label: 'aegis' },
+  { type: 'extractor', key: '1', label: 'extractor' },
+  { type: 'fabricator', key: '2', label: 'fabricator' },
+  { type: 'watchtower', key: '3', label: 'watchtower' },
+  { type: 'sensor_spire', key: '4', label: 'spire' },
+  { type: 'aegis_projector', key: '5', label: 'aegis' },
 ];
-const UNIT_ORDER: UnitType[] = ['ronin', 'oni', 'mantis', 'wasp'];
+const UNIT_ORDER: UnitType[] = ['ronin', 'oni', 'mantis', 'wasp', 'kumo'];
 const BEHAVIORS: Behavior[] = ['guard', 'assault', 'hold', 'hunt'];
+
+/** Native-tooltip text for a producible unit: stats + counter relationships. */
+function unitTooltip(u: UnitType): string {
+  const s = UNIT_STATS[u];
+  const strong = (Object.keys(COUNTER[u]) as (UnitType | 'building' | 'commander')[])
+    .filter((k) => k !== 'commander' && COUNTER[u][k] >= 1200)
+    .map((k) => (k === 'building' ? 'buildings' : k));
+  const counteredBy = UNIT_ORDER.filter((o) => o !== u && COUNTER[o][u] >= 1200);
+  return [
+    `${u} — ${s.cost}e · ${s.buildTime}s build`,
+    `${s.hp}hp · ${s.dps}dps · range ${s.minRange ? `${s.minRange}–` : ''}${s.range} · speed ${s.speed} · vision ${s.vision}`,
+    `strong vs: ${strong.join(', ') || '—'}`,
+    `countered by: ${counteredBy.join(', ') || '—'}`,
+  ].join('\n');
+}
+
+function buildingTooltip(t: BuildingType): string {
+  const s = BUILDING_STATS[t];
+  const extra = [
+    s.dps ? `${s.dps}dps · range ${s.range}` : '',
+    s.auraRadius ? `damage-reduction aura, radius ${s.auraRadius}` : '',
+    t === 'sensor_spire' ? `vision ${s.vision}` : '',
+    t === 'extractor' ? 'harvests the resource node it is placed on' : '',
+    t === 'fabricator' ? 'produces units continuously while powered' : '',
+  ].filter(Boolean);
+  return [`${t} — ${s.cost}e · ${s.buildTime}s build · ${s.hp}hp`, ...extra].join('\n');
+}
 
 export class Hud {
   placing: BuildingType | null = null;
@@ -58,6 +90,7 @@ export class Hud {
     for (const b of BUILDABLE) {
       const btn = document.createElement('button');
       btn.textContent = `${b.key}·${b.label} ${BUILDING_STATS[b.type].cost}e`;
+      btn.title = buildingTooltip(b.type);
       btn.onclick = () => {
         this.placing = b.type;
       };
@@ -90,8 +123,8 @@ export class Hud {
     this.placing = type;
   }
 
-  select(b: BuildingEnt | null): void {
-    this.selected = b ? b.id : null;
+  select(e: BuildingEnt | CommanderEnt | null): void {
+    this.selected = e ? e.id : null;
     this.panelKey = ''; // force re-render
   }
 
@@ -131,8 +164,10 @@ export class Hud {
       : '';
     const cmdr = game.commander(0);
     const over = p.override ? ` | OVERRIDE ${p.override}` : '';
+    const waveTicks = WAVE_INTERVAL * TICKS_PER_SECOND;
+    const waveEta = Math.ceil((waveTicks - (game.tick % waveTicks)) / TICKS_PER_SECOND);
     this.topbar.textContent =
-      `⚡ ${Math.floor(p.energy / FP)}  +${game.incomeRate(0)}/s | CMDR ${cmdr ? Math.ceil(cmdr.hp / FP) : 0}hp` +
+      `⚡ ${Math.floor(p.energy / FP)}  +${game.incomeRate(0)}/s | ⟳ wave ${waveEta}s | CMDR ${cmdr ? Math.ceil(cmdr.hp / FP) : 0}hp` +
       `${research}${over} | ${game.gameTime.toFixed(0)}s` +
       (opts.vsClaude ? ' | vs Claude' : '') +
       (opts.paused ? ' | PAUSED' : '') +
@@ -158,28 +193,129 @@ export class Hud {
     this.overlay.style.color = w === 0 ? 'var(--you)' : 'var(--enemy)';
   }
 
+  private renderCommanderPanel(c: CommanderEnt): void {
+    const p = this.game.players[0];
+    const cloaked = this.game.isCommanderCloaked(c);
+    const desc = (t: CommanderEnt['tasks'][number]): string => {
+      if (t.kind === 'move') return 'moving';
+      const b = this.game.building(t.building);
+      const name = b ? `${b.type} #${b.id}` : `#${t.building}`;
+      return t.kind === 'build' ? `constructing ${name}` : t.kind === 'repair' ? `repairing ${name}` : `adjusting ${name}`;
+    };
+    const status = c.tasks.length === 0 ? 'idle' : desc(c.tasks[0]) + (c.tasks.length > 1 ? ` (+${c.tasks.length - 1} queued)` : '');
+
+    const key = JSON.stringify(['cmdr', Math.ceil(c.hp / FP), status, cloaked, p.override, c.channeling]);
+    if (key === this.panelKey) return;
+    this.panelKey = key;
+
+    this.panel.innerHTML = '';
+    const h3 = document.createElement('h3');
+    h3.textContent = `COMMANDER — ${Math.ceil(c.hp / FP)}/${Math.ceil(c.maxHp / FP)}hp${cloaked ? ' · veiled' : ''}`;
+    this.panel.appendChild(h3);
+
+    const statusEl = document.createElement('div');
+    statusEl.className = 'row';
+    statusEl.textContent = c.channeling ? `⚙ ${status}` : status;
+    this.panel.appendChild(statusEl);
+
+    const row = (label: string, ...els: HTMLElement[]): void => {
+      const div = document.createElement('div');
+      div.className = 'row';
+      if (label) {
+        const span = document.createElement('span');
+        span.textContent = label;
+        div.appendChild(span);
+      }
+      for (const el of els) div.appendChild(el);
+      this.panel.appendChild(div);
+    };
+    const btn = (label: string, onClick: () => void, active = false, title = ''): HTMLButtonElement => {
+      const el = document.createElement('button');
+      el.textContent = label;
+      el.className = active ? 'active' : '';
+      el.title = title;
+      el.onclick = onClick;
+      return el;
+    };
+
+    row('', btn('stop', () => this.issue({ cmd: 'stop' }), false, 'clear all queued Commander orders'));
+    row(
+      'army:',
+      btn('fall back', () => this.issue({ cmd: 'global_override', stance: 'fall_back' }), p.override === 'fall_back',
+        'global override: all units retreat home (set at the bastion)'),
+      btn('defend', () => this.issue({ cmd: 'global_override', stance: 'defend' }), p.override === 'defend',
+        'global override: all units defend the base (set at the bastion)'),
+      btn('release', () => this.issue({ cmd: 'global_override', stance: 'release' }), p.override === null,
+        'clear the global override (set at the bastion)'),
+    );
+  }
+
   private renderPanel(): void {
-    const b = this.selected !== null ? this.game.building(this.selected) : null;
-    if (!b || b.player !== 0) {
+    const ent = this.selected !== null ? this.game.entities.get(this.selected) : undefined;
+    if (ent && ent.kind === 'commander' && ent.player === 0) {
+      this.panel.style.display = 'block';
+      return this.renderCommanderPanel(ent);
+    }
+    const b = ent && ent.kind === 'building' && ent.player === 0 ? ent : null;
+    if (!b) {
       this.panel.style.display = 'none';
       this.selected = null;
       return;
     }
     this.panel.style.display = 'block';
 
+    const pct = b.done ? 100 : Math.min(100, Math.floor((100 * b.buildTicks) / b.buildTicksNeeded));
+
+    // Construction status from the Commander's task queue (so "resume" shows feedback).
+    const cmdr = this.game.commander(0);
+    const taskIdx = cmdr ? cmdr.tasks.findIndex((t) => t.kind === 'build' && t.building === b.id) : -1;
+    const status = b.done
+      ? ''
+      : taskIdx === 0
+        ? cmdr!.channeling
+          ? 'constructing…'
+          : 'commander en route…'
+        : taskIdx > 0
+          ? `queued (${taskIdx + 1} in line)`
+          : 'PAUSED';
+
+    // Fabricator bay status: producing / holding for the wave / starved / off.
+    const waveTicks = WAVE_INTERVAL * TICKS_PER_SECOND;
+    const waveEta = Math.ceil((waveTicks - (this.game.tick % waveTicks)) / TICKS_PER_SECOND);
+    const prodState = b.ready !== null ? 'ready' : b.prodTicksLeft >= 0 ? 'prod' : b.on ? 'wait' : 'off';
+    const prodText =
+      b.type !== 'fabricator' || !b.done
+        ? ''
+        : b.ready !== null
+          ? `▶ ${b.ready} ready — deploys with wave in ${waveEta}s`
+          : b.prodTicksLeft >= 0
+            ? `⚙ building ${b.production} — ${Math.ceil(b.prodTicksLeft / TICKS_PER_SECOND)}s`
+            : b.on
+              ? 'awaiting energy…'
+              : 'production off';
+
     // Re-render only when the displayed state changes (keeps buttons clickable).
     const key = JSON.stringify([
       b.id, b.type, b.done, Math.ceil(b.hp / FP), b.production, b.on, b.behavior,
-      b.rally.x, b.rally.y, this.rallyArm,
+      b.rally.x, b.rally.y, this.rallyArm, status, prodState,
       b.type === 'bastion' ? availableTechs(this.game, 0) : null,
       this.game.players[0].research?.tech ?? null,
     ]);
-    if (key === this.panelKey) return;
+    if (key === this.panelKey) {
+      // progress/countdowns tick without rebuilding the panel (buttons stay clickable)
+      const fill = this.panel.querySelector<HTMLElement>('#build-fill');
+      if (fill) fill.style.width = `${pct}%`;
+      const label = this.panel.querySelector<HTMLElement>('#build-pct');
+      if (label) label.textContent = `${pct}%`;
+      const eta = this.panel.querySelector<HTMLElement>('#prod-eta');
+      if (eta) eta.textContent = prodText;
+      return;
+    }
     this.panelKey = key;
 
     this.panel.innerHTML = '';
     const h3 = document.createElement('h3');
-    h3.textContent = `${b.type} #${b.id} — ${Math.ceil(b.hp / FP)}/${Math.ceil(b.maxHp / FP)}hp${b.done ? '' : ' (building…)'}`;
+    h3.textContent = `${b.type} #${b.id} — ${Math.ceil(b.hp / FP)}/${Math.ceil(b.maxHp / FP)}hp${b.done ? '' : ` — ${status}`}`;
     this.panel.appendChild(h3);
 
     const row = (label: string, ...els: HTMLElement[]): void => {
@@ -202,17 +338,36 @@ export class Hud {
     };
 
     if (!b.done) {
-      row('', btn('resume', () => this.issue({ cmd: 'resume_build', building: b.id })));
+      const barBg = document.createElement('div');
+      barBg.style.cssText = 'height:7px;background:#0d1a22;border:1px solid #1f4a55;border-radius:2px;margin:6px 0 2px;overflow:hidden;';
+      const fill = document.createElement('div');
+      fill.id = 'build-fill';
+      fill.style.cssText = `height:100%;width:${pct}%;background:#39e0d0;transition:width .15s linear;`;
+      barBg.appendChild(fill);
+      this.panel.appendChild(barBg);
+      const label = document.createElement('div');
+      label.id = 'build-pct';
+      label.style.cssText = 'font-size:11px;opacity:.7;margin-bottom:4px;';
+      label.textContent = `${pct}%`;
+      this.panel.appendChild(label);
+      if (status === 'PAUSED') row('', btn('resume', () => this.issue({ cmd: 'resume_build', building: b.id })));
       row('', btn('cancel (75% back)', () => this.issue({ cmd: 'cancel_build', building: b.id })));
       return;
     }
 
     if (b.type === 'fabricator') {
+      const eta = document.createElement('div');
+      eta.id = 'prod-eta';
+      eta.style.cssText = 'font-size:11px;opacity:.8;margin-bottom:4px;';
+      eta.textContent = prodText;
+      this.panel.appendChild(eta);
       row(
         'unit:',
-        ...UNIT_ORDER.map((u) =>
-          btn(u, () => this.issue({ cmd: 'set_production', building: b.id, unit: u, on: true }), b.production === u),
-        ),
+        ...UNIT_ORDER.map((u) => {
+          const el = btn(u, () => this.issue({ cmd: 'set_production', building: b.id, unit: u, on: true }), b.production === u);
+          el.title = unitTooltip(u); // hover for stats + counters
+          return el;
+        }),
       );
       row(
         'mode:',

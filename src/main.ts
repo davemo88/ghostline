@@ -10,8 +10,11 @@ import {
   FP,
   Game,
   TICKS_PER_SECOND,
+  UNIT_STATS,
+  type UnitType,
   VISION_INTERVAL,
 } from './sim';
+import { loadTuning, resetTuning, saveTuning, UNIT_DEFAULTS, VISUAL_TUNING } from './tuning';
 import { SceneRig } from './render/scene';
 import { Terrain } from './render/terrain';
 import { EntityLayer } from './render/entities';
@@ -21,6 +24,7 @@ import { createAnthropicTransport, DEFAULT_MODEL } from './claude/anthropic';
 import { ScriptedBot } from './bots/scripted';
 
 const params = new URLSearchParams(location.search);
+loadTuning(); // apply saved unit tuning before the sim starts
 const game = new Game(params.has('seed') ? Number(params.get('seed')) : Date.now() % 2 ** 31);
 
 // ?demo: two scripted bots play each other (visual test / attract mode).
@@ -78,6 +82,86 @@ const hud = new Hud(game, issue, (x, y) => {
 let revealAll = false;
 let paused = false;
 
+// debug menu (` to toggle)
+const debugMenu = document.getElementById('debugmenu')!;
+const dbgInstant = document.getElementById('dbg-instant') as HTMLInputElement;
+dbgInstant.onchange = () => {
+  game.debugInstantBuild = dbgInstant.checked;
+};
+
+// -- unit tuning UI: numeric fields bound straight to UNIT_STATS / VISUAL_TUNING
+const dbgUnitSel = document.getElementById('dbg-unit') as HTMLSelectElement;
+const dbgFields = document.getElementById('dbg-fields')!;
+const TUNABLE: { key: keyof (typeof UNIT_STATS)['kumo']; label: string }[] = [
+  { key: 'cost', label: 'cost (e)' },
+  { key: 'buildTime', label: 'build time (s)' },
+  { key: 'hp', label: 'hp (new units)' },
+  { key: 'dps', label: 'dps' },
+  { key: 'range', label: 'range (u)' },
+  { key: 'minRange', label: 'min range (u)' },
+  { key: 'speed', label: 'speed (u/s)' },
+  { key: 'vision', label: 'vision (u)' },
+  { key: 'burstTicks', label: 'burst cooldown (ticks)' },
+];
+for (const u of Object.keys(UNIT_STATS)) {
+  const opt = document.createElement('option');
+  opt.value = u;
+  opt.textContent = u;
+  dbgUnitSel.appendChild(opt);
+}
+dbgUnitSel.value = 'kumo';
+
+function tuningRow(label: string, value: number, dflt: number, apply: (v: number) => void): void {
+  const row = document.createElement('div');
+  row.className = 'trow';
+  const span = document.createElement('span');
+  span.textContent = label;
+  span.title = `default: ${dflt}`;
+  const input = document.createElement('input');
+  input.type = 'number';
+  input.step = 'any';
+  input.value = String(value);
+  input.oninput = () => {
+    const v = parseFloat(input.value);
+    if (Number.isFinite(v) && v >= 0) {
+      apply(v);
+      saveTuning();
+    }
+  };
+  row.append(span, input);
+  dbgFields.appendChild(row);
+}
+
+function renderTuning(): void {
+  const u = dbgUnitSel.value as UnitType;
+  const stats = UNIT_STATS[u];
+  dbgFields.innerHTML = '';
+  for (const f of TUNABLE) {
+    tuningRow(f.label, stats[f.key] ?? 1, UNIT_DEFAULTS[u][f.key] ?? 1, (v) => {
+      stats[f.key] = f.key === 'burstTicks' ? Math.max(1, Math.round(v)) : v;
+    });
+  }
+  if (u === 'kumo') {
+    tuningRow('burst rounds (visual)', VISUAL_TUNING.kumoBurstRounds, 4, (v) => {
+      VISUAL_TUNING.kumoBurstRounds = Math.max(1, Math.round(v));
+    });
+    tuningRow('round spacing (frames)', VISUAL_TUNING.kumoBurstSpacing, 2, (v) => {
+      VISUAL_TUNING.kumoBurstSpacing = Math.max(1, Math.round(v));
+    });
+  }
+}
+dbgUnitSel.onchange = renderTuning;
+renderTuning();
+
+document.getElementById('dbg-reset')!.onclick = () => {
+  resetTuning(dbgUnitSel.value as UnitType);
+  renderTuning();
+};
+document.getElementById('dbg-reset-all')!.onclick = () => {
+  resetTuning();
+  renderTuning();
+};
+
 // placement ghost
 const ghost = new THREE.Mesh(
   new THREE.BoxGeometry(1, 1, 1),
@@ -121,7 +205,14 @@ window.addEventListener('contextmenu', (ev) => {
     return;
   }
   updateRay(ev);
-  if (mouseGround) issue({ cmd: 'move', pos: [mouseGround.x, mouseGround.y], replace: true });
+  if (!mouseGround) return;
+  // selected fabricator: right-click retargets its rally instead of moving the Commander
+  const sel = hud.selected !== null ? game.building(hud.selected) : null;
+  if (sel && sel.player === 0 && sel.done && sel.type === 'fabricator') {
+    issue({ cmd: 'set_rally', building: sel.id, pos: [mouseGround.x, mouseGround.y] });
+    return;
+  }
+  issue({ cmd: 'move', pos: [mouseGround.x, mouseGround.y], replace: true });
 });
 
 window.addEventListener('mousedown', (ev) => {
@@ -141,12 +232,13 @@ window.addEventListener('mousedown', (ev) => {
   hud.select(entities.pick(raycaster, game));
 });
 
+// digits — WASD is camera pan
 const BUILD_KEYS: Record<string, BuildingType> = {
-  e: 'extractor',
-  f: 'fabricator',
-  w: 'watchtower',
-  s: 'sensor_spire',
-  a: 'aegis_projector',
+  '1': 'extractor',
+  '2': 'fabricator',
+  '3': 'watchtower',
+  '4': 'sensor_spire',
+  '5': 'aegis_projector',
 };
 
 let lastSpace = 0;
@@ -166,6 +258,8 @@ window.addEventListener('keydown', (ev) => {
     hud.placing = hud.placing ? null : 'extractor';
   } else if (BUILD_KEYS[k]) {
     hud.placing = BUILD_KEYS[k];
+  } else if (k === '`') {
+    debugMenu.style.display = debugMenu.style.display === 'block' ? 'none' : 'block';
   } else if (k === 'k') toggleClaude();
   else if (k === 'm') hud.showIntel = !hud.showIntel;
   else if (k === 'x') revealAll = !revealAll;
@@ -223,7 +317,7 @@ function frame(): void {
   const alpha = Math.min(1, (now - lastStepTime) / (1000 / TICKS_PER_SECOND));
   const cmdr = game.commander(0);
   rig.update(dt, cmdr ? { x: cmdr.pos.x / FP, z: cmdr.pos.y / FP } : null);
-  entities.update(game, prevPos, alpha);
+  entities.update(game, prevPos, alpha, hud.selected);
 
   // placement ghost
   if (hud.placing && mouseGround) {

@@ -4,6 +4,7 @@
 export * from './constants';
 export { Game } from './game';
 export type {
+  AttackEvent,
   Command,
   CommanderEnt,
   BuildingEnt,

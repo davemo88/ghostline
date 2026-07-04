@@ -10,7 +10,7 @@ export const FP = 1000; // fixed-point scale for world units
 export const MAP_SIZE = 180; // world units, square
 export const STARTING_ENERGY = 200 * 1000; // me
 
-export type UnitType = 'ronin' | 'oni' | 'mantis' | 'wasp';
+export type UnitType = 'ronin' | 'oni' | 'mantis' | 'wasp' | 'kumo';
 export type BuildingType =
   | 'bastion'
   | 'extractor'
@@ -28,6 +28,7 @@ export interface UnitStats {
   minRange: number; // u (0 = none)
   speed: number; // u/s
   vision: number; // u
+  burstTicks?: number; // fires one volley every N ticks, dps preserved (default 1 = every tick)
 }
 
 export const UNIT_STATS: Record<UnitType, UnitStats> = {
@@ -35,15 +36,18 @@ export const UNIT_STATS: Record<UnitType, UnitStats> = {
   oni: { cost: 120, buildTime: 35, hp: 400, dps: 20, range: 10, minRange: 0, speed: 3.5, vision: 10 },
   mantis: { cost: 100, buildTime: 30, hp: 90, dps: 25, range: 22, minRange: 6, speed: 3.0, vision: 10 },
   wasp: { cost: 40, buildTime: 12, hp: 60, dps: 8, range: 6, minRange: 0, speed: 8.0, vision: 14 },
+  kumo: { cost: 80, buildTime: 22, hp: 150, dps: 16, range: 12, minRange: 0, speed: 4.5, vision: 12, burstTicks: 8 },
 };
 
 // Counter multipliers, per-mille, attacker -> defender. Buildings and the
 // Commander use the 'building'/'commander' columns.
 export const COUNTER: Record<UnitType, Record<UnitType | 'building' | 'commander', number>> = {
-  ronin: { ronin: 1000, oni: 600, mantis: 1500, wasp: 1200, building: 800, commander: 1000 },
-  oni: { ronin: 1500, oni: 1000, mantis: 800, wasp: 800, building: 1200, commander: 1000 },
-  mantis: { ronin: 800, oni: 1500, mantis: 1000, wasp: 500, building: 1500, commander: 1000 },
-  wasp: { ronin: 700, oni: 500, mantis: 1000, wasp: 1000, building: 1500, commander: 1000 },
+  ronin: { ronin: 1000, oni: 600, mantis: 1500, wasp: 1200, kumo: 800, building: 800, commander: 1000 },
+  oni: { ronin: 1500, oni: 1000, mantis: 800, wasp: 800, kumo: 1400, building: 1200, commander: 1000 },
+  mantis: { ronin: 800, oni: 1500, mantis: 1000, wasp: 500, kumo: 1200, building: 1500, commander: 1000 },
+  wasp: { ronin: 700, oni: 500, mantis: 1000, wasp: 1000, kumo: 700, building: 1500, commander: 1000 },
+  // light spider tank: twin LMGs shred light units, useless into armor/structures
+  kumo: { ronin: 1400, oni: 600, mantis: 1100, wasp: 1400, kumo: 1000, building: 600, commander: 1000 },
 };
 
 export interface BuildingStats {
@@ -56,6 +60,9 @@ export interface BuildingStats {
   range?: number;
   auraRadius?: number;
 }
+
+/** All fabricators release finished units together on this shared cycle (s). */
+export const WAVE_INTERVAL = 10;
 
 export const BUILDING_STATS: Record<BuildingType, BuildingStats> = {
   bastion: { cost: 0, buildTime: 0, hp: 1500, footprint: 6, vision: 12 },

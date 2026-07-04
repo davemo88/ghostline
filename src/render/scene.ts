@@ -1,5 +1,5 @@
-// Scene + RTS camera rig (§12): pan (arrows/edge-scroll/minimap), wheel zoom,
-// fixed yaw, space snaps to the Commander, double-space toggles follow-cam.
+// Scene + RTS camera rig (§12): pan (WASD/arrows/edge-scroll/minimap), wheel
+// zoom, fixed yaw, space snaps to the Commander, double-space toggles follow-cam.
 
 import * as THREE from 'three';
 import { MAP_SIZE } from '../sim';
@@ -37,8 +37,8 @@ export class SceneRig {
       this.camera.updateProjectionMatrix();
       this.renderer.setSize(window.innerWidth, window.innerHeight);
     });
-    window.addEventListener('keydown', (e) => this.keys.add(e.key));
-    window.addEventListener('keyup', (e) => this.keys.delete(e.key));
+    window.addEventListener('keydown', (e) => this.keys.add(e.key.length === 1 ? e.key.toLowerCase() : e.key));
+    window.addEventListener('keyup', (e) => this.keys.delete(e.key.length === 1 ? e.key.toLowerCase() : e.key));
     window.addEventListener('mousemove', (e) => {
       const m = 12;
       this.mouseAtEdge.x = e.clientX < m ? -1 : e.clientX > window.innerWidth - m ? 1 : 0;
@@ -62,10 +62,10 @@ export class SceneRig {
       const speed = this.dist * 0.9 * dt;
       let dx = this.mouseAtEdge.x;
       let dz = this.mouseAtEdge.y;
-      if (this.keys.has('ArrowLeft')) dx -= 1;
-      if (this.keys.has('ArrowRight')) dx += 1;
-      if (this.keys.has('ArrowUp')) dz -= 1;
-      if (this.keys.has('ArrowDown')) dz += 1;
+      if (this.keys.has('ArrowLeft') || this.keys.has('a')) dx -= 1;
+      if (this.keys.has('ArrowRight') || this.keys.has('d')) dx += 1;
+      if (this.keys.has('ArrowUp') || this.keys.has('w')) dz -= 1;
+      if (this.keys.has('ArrowDown') || this.keys.has('s')) dz += 1;
       this.target.x = THREE.MathUtils.clamp(this.target.x + dx * speed, 0, MAP_SIZE);
       this.target.z = THREE.MathUtils.clamp(this.target.z + dz * speed, 0, MAP_SIZE);
       if (dx !== 0 || dz !== 0) this.follow = false;

@@ -150,7 +150,7 @@ const BUILD_KEYS: Record<string, BuildingType> = {
   s: 'sensor_spire',
   a: 'aegis_projector',
 };
-const UNIT_KEYS: Record<string, UnitType> = { 1: 'ronin', 2: 'oni', 3: 'mantis', 4: 'wasp' };
+const UNIT_KEYS: Record<string, UnitType> = { 1: 'ronin', 2: 'oni', 3: 'mantis', 4: 'wasp', 5: 'kumo' };
 const BEHAVIOR_KEYS: Record<string, Behavior> = { g: 'guard', h: 'hold', u: 'assault', n: 'hunt' };
 
 window.addEventListener('keydown', (ev) => {

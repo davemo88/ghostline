@@ -14,6 +14,7 @@ const COUNTER_PICK: Record<UnitType, UnitType> = {
   oni: 'mantis',
   mantis: 'ronin',
   wasp: 'ronin',
+  kumo: 'oni',
 };
 
 export class ScriptedBot {

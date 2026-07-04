@@ -13,8 +13,9 @@ import {
   TECHS,
   UNIT_STATS,
   type UnitType,
+  WAVE_INTERVAL,
 } from '../sim';
-const UNIT_TYPES: UnitType[] = ['ronin', 'oni', 'mantis', 'wasp'];
+const UNIT_TYPES: UnitType[] = ['ronin', 'oni', 'mantis', 'wasp', 'kumo'];
 
 function unitTable(): string {
   const rows = UNIT_TYPES.map((t) => {
@@ -82,7 +83,7 @@ ${counterTable()}
 BUILDINGS:
 ${buildingTable()}
 
-FABRICATORS produce ONE unit type continuously while ON (repeat: wait for cost -> build -> spawn). Units inherit the fabricator's rally point + behavior and follow live changes to them. Behaviors: guard (fight within 15 of rally, leash 10), assault (attack-move to rally), hold (never chase), hunt (seek nearest known enemy anywhere).
+FABRICATORS produce ONE unit type continuously while ON (repeat: wait for cost -> build -> hold in bay). All bays deploy together on a shared ${WAVE_INTERVAL}s wave cycle (both players' waves are simultaneous). Units inherit the fabricator's rally point + behavior and follow live changes to them. Behaviors: guard (fight within 15 of rally, leash 10), assault (attack-move to rally), hold (never chase), hunt (seek nearest known enemy anywhere).
 
 GLOBAL OVERRIDE (Commander at Bastion): fall_back (all units retreat, no fighting) / defend (all guard the Bastion) / release.
 
@@ -102,7 +103,7 @@ COMMANDS (respond with a JSON object {memo, commands}). Commands queue in order;
 - {"cmd":"repair","building":id}
 - {"cmd":"set_rally","building":id,"pos":[x,y]}
 - {"cmd":"set_behavior","building":id,"behavior":"guard|assault|hold|hunt"}
-- {"cmd":"set_production","building":id,"unit":"ronin|oni|mantis|wasp","on":true}
+- {"cmd":"set_production","building":id,"unit":"ronin|oni|mantis|wasp|kumo","on":true}
 - {"cmd":"research","tech":"eco1|...|cmd3"}
 - {"cmd":"global_override","stance":"fall_back|defend|release"}
 
