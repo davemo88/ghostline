@@ -195,6 +195,33 @@
         font-size: 12px;
         border-color: rgba(208, 92, 224, 0.45);
       }
+      #debugmenu .wg-add {
+        display: flex;
+        gap: 4px;
+        align-items: center;
+        margin: 3px 0;
+      }
+      #debugmenu .wg-add select {
+        flex: 1;
+        min-width: 0;
+      }
+      #debugmenu .wg-add input {
+        width: 46px;
+      }
+      #debugmenu .wg-add button {
+        margin: 0;
+        padding: 2px 7px;
+      }
+      #debugmenu .wg-item {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin: 2px 0 2px 26px;
+      }
+      #debugmenu .wg-item button {
+        margin: 0;
+        padding: 0 6px;
+      }
       #debugmenu select,
       #debugmenu input[type='number'] {
         background: rgba(208, 92, 224, 0.08);
@@ -258,6 +285,25 @@
     <div id="debugmenu" class="holo">
       <h3>⟨ DEBUG ⟩</h3>
       <label><input type="checkbox" id="dbg-instant" /> instant construction</label>
+      <div class="trow"><span>wave interval (s)</span><input type="number" id="dbg-wave" min="1" step="1" /></div>
+      <h3 style="margin-top:10px">⟨ WAR-GAME ⟩</h3>
+      <div class="wg-add">
+        <span class="wg-tag" style="color:var(--you)">you</span>
+        <select id="wg-type0"></select>
+        <input type="number" id="wg-qty0" value="4" min="1" />
+        <button id="wg-add0">+</button>
+      </div>
+      <div id="wg-list0"></div>
+      <div class="wg-add">
+        <span class="wg-tag" style="color:var(--enemy)">foe</span>
+        <select id="wg-type1"></select>
+        <input type="number" id="wg-qty1" value="4" min="1" />
+        <button id="wg-add1">+</button>
+      </div>
+      <div id="wg-list1"></div>
+      <div style="margin-top:4px"><button id="wg-kill">💀 kill all units</button></div>
+      <div class="hint">spawns free each wave while the list has entries · rally: opposing base</div>
+      <div class="hint">url: ?wg0=ronin:4,kumo:2&amp;wg1=wasp:6</div>
       <h3 style="margin-top:10px">⟨ UNIT TUNING ⟩</h3>
       <select id="dbg-unit"></select>
       <div id="dbg-fields"></div>

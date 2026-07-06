@@ -6,7 +6,7 @@
 // this. Tuned values break replay parity against the stock constants (same
 // caveat as debugInstantBuild).
 
-import { UNIT_STATS, type UnitStats, type UnitType } from './sim';
+import { setWaveInterval, UNIT_STATS, type UnitStats, type UnitType, WAVE_INTERVAL } from './sim';
 
 /** Pristine copy of the shipped constants, captured before any overrides. */
 export const UNIT_DEFAULTS: Record<UnitType, UnitStats> = JSON.parse(JSON.stringify(UNIT_STATS));
@@ -17,6 +17,7 @@ export const VISUAL_TUNING = {
   kumoBurstSpacing: 2, // frames between tracers
 };
 const VISUAL_DEFAULTS = { ...VISUAL_TUNING };
+const WAVE_DEFAULT = WAVE_INTERVAL; // captured before any overrides
 
 const KEY = 'ghostline_tuning';
 
@@ -27,11 +28,13 @@ export function loadTuning(): void {
     const data = JSON.parse(raw) as {
       units?: Record<string, Partial<UnitStats>>;
       visual?: Partial<typeof VISUAL_TUNING>;
+      waveInterval?: number;
     };
     for (const [u, fields] of Object.entries(data.units ?? {})) {
       if (u in UNIT_STATS) Object.assign(UNIT_STATS[u as UnitType], fields);
     }
     Object.assign(VISUAL_TUNING, data.visual ?? {});
+    if (typeof data.waveInterval === 'number') setWaveInterval(data.waveInterval);
   } catch {
     // corrupted save — ignore, run on defaults
   }
@@ -53,8 +56,12 @@ export function saveTuning(): void {
   for (const k of Object.keys(VISUAL_TUNING) as (keyof typeof VISUAL_TUNING)[]) {
     if (VISUAL_TUNING[k] !== VISUAL_DEFAULTS[k]) visual[k] = VISUAL_TUNING[k];
   }
-  if (Object.keys(units).length || Object.keys(visual).length) {
-    localStorage.setItem(KEY, JSON.stringify({ units, visual }));
+  const waveDiff = WAVE_INTERVAL !== WAVE_DEFAULT;
+  if (Object.keys(units).length || Object.keys(visual).length || waveDiff) {
+    localStorage.setItem(
+      KEY,
+      JSON.stringify({ units, visual, ...(waveDiff ? { waveInterval: WAVE_INTERVAL } : {}) }),
+    );
   } else {
     localStorage.removeItem(KEY);
   }
@@ -68,6 +75,9 @@ export function resetTuning(unit?: UnitType): void {
     for (const k of Object.keys(stats)) if (!(k in defs)) delete stats[k];
     Object.assign(stats, JSON.parse(JSON.stringify(defs)));
   }
-  if (!unit) Object.assign(VISUAL_TUNING, VISUAL_DEFAULTS);
+  if (!unit) {
+    Object.assign(VISUAL_TUNING, VISUAL_DEFAULTS);
+    setWaveInterval(WAVE_DEFAULT);
+  }
   saveTuning();
 }

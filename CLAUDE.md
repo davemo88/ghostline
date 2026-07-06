@@ -9,7 +9,8 @@ to be playable by both humans and Claude. Full design: `DESIGN_2.md` (authoritat
 - `npm run dev` — Vite dev server. `/` is the Three.js game (K = play vs Claude);
   `/debug.html` is the 2D sim debugger. Game URL params: `?demo` (scripted bots
   play), `?fast` (4x), `?seed=N`, `?snap=MS` (headless-screenshot aid: delays the
-  load event and mirrors one WebGL frame into an `<img>`).
+  load event and mirrors one WebGL frame into an `<img>`), `?wg0=ronin:4,kumo:2&wg1=wasp:6`
+  (war-game sandbox: free comps auto-spawn each wave for either side, debug menu opens).
 - `npm test` — vitest suite
 - `npm run build` — typecheck + production build (both pages)
 - `ANTHROPIC_API_KEY=... npm run cvc` — headless Claude-vs-Claude match; env knobs: `MODEL` (default `claude-fable-5`), `SEED`, `INTERVAL` (decision seconds), `MAX_MINUTES`. Writes a replay (seed + command log + final hash) to `replays/`.

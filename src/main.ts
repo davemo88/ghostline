@@ -14,6 +14,7 @@ import {
   type UnitType,
   VISION_INTERVAL,
 } from './sim';
+import { setWaveInterval, WAVE_INTERVAL } from './sim';
 import { loadTuning, resetTuning, saveTuning, UNIT_DEFAULTS, VISUAL_TUNING } from './tuning';
 import { SceneRig } from './render/scene';
 import { Terrain } from './render/terrain';
@@ -89,12 +90,117 @@ dbgInstant.onchange = () => {
   game.debugInstantBuild = dbgInstant.checked;
 };
 
+// wave interval: applies live (sim reads it every tick) and persists via tuning
+const dbgWave = document.getElementById('dbg-wave') as HTMLInputElement;
+dbgWave.value = String(WAVE_INTERVAL); // post-loadTuning, so shows any saved override
+dbgWave.oninput = () => {
+  const v = parseFloat(dbgWave.value);
+  if (Number.isFinite(v) && v >= 1) {
+    setWaveInterval(v);
+    saveTuning();
+  }
+};
+
+// -- war-game sandbox: pick type+qty per side; the list itself is the switch
+// (war-game is active while a list has entries; entries persist across runs)
+type WargameItem = { type: UnitType; count: number };
+const wargameLists: [WargameItem[], WargameItem[]] = [[], []];
+
+function applyWargame(persist = true): void {
+  game.debugWaveComp = wargameLists.map((list) => {
+    if (!list.length) return null;
+    const comp: Partial<Record<UnitType, number>> = {};
+    for (const it of list) comp[it.type] = (comp[it.type] ?? 0) + it.count;
+    return comp;
+  }) as typeof game.debugWaveComp;
+  if (persist) localStorage.setItem('ghostline_sandbox', JSON.stringify(wargameLists));
+}
+
+function renderWargame(side: 0 | 1): void {
+  const listEl = document.getElementById(`wg-list${side}`)!;
+  listEl.innerHTML = '';
+  wargameLists[side].forEach((it, i) => {
+    const row = document.createElement('div');
+    row.className = 'wg-item';
+    const label = document.createElement('span');
+    label.textContent = `${it.count} × ${it.type}`;
+    const del = document.createElement('button');
+    del.textContent = '×';
+    del.onclick = () => {
+      wargameLists[side].splice(i, 1);
+      renderWargame(side);
+      applyWargame();
+    };
+    row.append(label, del);
+    listEl.appendChild(row);
+  });
+}
+
+for (const side of [0, 1] as const) {
+  const typeSel = document.getElementById(`wg-type${side}`) as HTMLSelectElement;
+  const qty = document.getElementById(`wg-qty${side}`) as HTMLInputElement;
+  for (const u of Object.keys(UNIT_STATS)) {
+    const opt = document.createElement('option');
+    opt.value = u;
+    opt.textContent = u;
+    typeSel.appendChild(opt);
+  }
+  (document.getElementById(`wg-add${side}`) as HTMLButtonElement).onclick = () => {
+    const count = Math.max(1, Math.min(50, Math.round(Number(qty.value) || 0)));
+    wargameLists[side].push({ type: typeSel.value as UnitType, count });
+    renderWargame(side);
+    applyWargame();
+  };
+}
+
+(document.getElementById('wg-kill') as HTMLButtonElement).onclick = () => {
+  game.debugKillAllUnits();
+};
+
+try {
+  const saved = JSON.parse(localStorage.getItem('ghostline_sandbox') ?? '[]');
+  for (const side of [0, 1] as const) {
+    for (const it of saved[side] ?? []) {
+      if (it && it.type in UNIT_STATS && Number(it.count) > 0) {
+        wargameLists[side].push({ type: it.type, count: Math.min(50, Math.round(Number(it.count))) });
+      }
+    }
+    renderWargame(side);
+  }
+  applyWargame();
+} catch {
+  // corrupted save — start blank
+}
+
+// URL-driven war-game: ?wg0=ronin:4,kumo:2&wg1=wasp:6 (also accepts "4ronin").
+// Overrides any saved lists for this session only (not written to localStorage
+// until you edit the list by hand), and opens the debug menu.
+function parseWgParam(raw: string | null): WargameItem[] {
+  const items: WargameItem[] = [];
+  for (const part of (raw ?? '').split(',')) {
+    const m = /^([a-z_]+)[:x]?(\d+)$/i.exec(part.trim()) ?? /^(\d+)\s*x?\s*([a-z_]+)$/i.exec(part.trim());
+    if (!m) continue;
+    const countFirst = /^\d/.test(m[1]);
+    const type = (countFirst ? m[2] : m[1]).toLowerCase() as UnitType;
+    const count = Number(countFirst ? m[1] : m[2]);
+    if (type in UNIT_STATS && count > 0) items.push({ type, count: Math.min(50, Math.round(count)) });
+  }
+  return items;
+}
+if (params.has('wg0') || params.has('wg1')) {
+  for (const side of [0, 1] as const) {
+    wargameLists[side] = parseWgParam(params.get(`wg${side}`));
+    renderWargame(side);
+  }
+  applyWargame(false); // session-only: don't clobber the saved sandbox
+  debugMenu.style.display = 'block';
+}
+
 // -- unit tuning UI: numeric fields bound straight to UNIT_STATS / VISUAL_TUNING
 const dbgUnitSel = document.getElementById('dbg-unit') as HTMLSelectElement;
 const dbgFields = document.getElementById('dbg-fields')!;
 const TUNABLE: { key: keyof (typeof UNIT_STATS)['kumo']; label: string }[] = [
   { key: 'cost', label: 'cost (e)' },
-  { key: 'buildTime', label: 'build time (s)' },
   { key: 'hp', label: 'hp (new units)' },
   { key: 'dps', label: 'dps' },
   { key: 'range', label: 'range (u)' },
@@ -102,6 +208,14 @@ const TUNABLE: { key: keyof (typeof UNIT_STATS)['kumo']; label: string }[] = [
   { key: 'speed', label: 'speed (u/s)' },
   { key: 'vision', label: 'vision (u)' },
   { key: 'burstTicks', label: 'burst cooldown (ticks)' },
+  { key: 'radius', label: 'body radius (u)' },
+  { key: 'accel', label: 'accel (u/s²)' },
+  { key: 'decel', label: 'brake (u/s²)' },
+  { key: 'turnRate', label: 'turn rate (deg/s)' },
+  { key: 'turnRateMin', label: 'turn @ max speed (deg/s)' },
+  { key: 'windupTicks', label: 'barrel-raise (ticks)' },
+  { key: 'splashRadius', label: 'splash radius (u)' },
+  { key: 'shellSpeed', label: 'shell speed (u/s)' },
 ];
 for (const u of Object.keys(UNIT_STATS)) {
   const opt = document.createElement('option');

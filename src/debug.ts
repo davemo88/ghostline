@@ -150,7 +150,7 @@ const BUILD_KEYS: Record<string, BuildingType> = {
   s: 'sensor_spire',
   a: 'aegis_projector',
 };
-const UNIT_KEYS: Record<string, UnitType> = { 1: 'ronin', 2: 'oni', 3: 'mantis', 4: 'wasp', 5: 'kumo' };
+const UNIT_KEYS: Record<string, UnitType> = { 1: 'ronin', 2: 'oni', 3: 'mantis', 4: 'wasp', 5: 'kumo', 6: 'kaze', 7: 'taiko' };
 const BEHAVIOR_KEYS: Record<string, Behavior> = { g: 'guard', h: 'hold', u: 'assault', n: 'hunt' };
 
 window.addEventListener('keydown', (ev) => {
@@ -277,6 +277,27 @@ function draw(): void {
       ctx.fillStyle = '#7fff9e';
       ctx.fillRect(px(u.pos.x) - 4, px(u.pos.y) - 7, (8 * u.hp) / u.maxHp, 2);
     }
+  }
+
+  // artillery shells in flight: dot along the line + splash ring at the aim point
+  for (const sh of game.shells) {
+    if (
+      fogEnabled &&
+      sh.player === 1 &&
+      !game.cellVisibleForSnapshot(0, sh.from) &&
+      !game.cellVisibleForSnapshot(0, sh.to)
+    ) {
+      continue;
+    }
+    const t = 1 - sh.ticksLeft / sh.ticksTotal;
+    ctx.fillStyle = '#ffd27f';
+    ctx.beginPath();
+    ctx.arc(px(sh.from.x + (sh.to.x - sh.from.x) * t), px(sh.from.y + (sh.to.y - sh.from.y) * t), 2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,210,127,0.35)';
+    ctx.beginPath();
+    ctx.arc(px(sh.to.x), px(sh.to.y), (sh.splashMu / FP) * SCALE, 0, Math.PI * 2);
+    ctx.stroke();
   }
 
   // commanders

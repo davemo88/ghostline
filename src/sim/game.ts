@@ -18,6 +18,9 @@ import {
   CAPTURE_POINT_VISION,
   CAPTURE_RADIUS,
   CAPTURE_UPLINK_VISION,
+  COHESION_BREAK_RANGE,
+  COHESION_RADIUS,
+  COHESION_SLACK,
   COMMANDER,
   COUNTER,
   type CaptureBuff,
@@ -30,6 +33,8 @@ import {
   HARDENED_FRAMES_HP,
   HIGH_GROUND_DAMAGE,
   INCOME,
+  KITE_CORRIDOR,
+  KITE_LANE_BACKSTEP,
   NANOWEAVE_DELAY_SECONDS,
   NANOWEAVE_REGEN,
   type OverrideStance,
@@ -77,6 +82,11 @@ export interface UnitEnt extends PathState {
   rally: Vec; // inherited, refreshed from live source fabricator
   behavior: Behavior;
   targetId: number; // 0 = none
+  // Vehicle state (units with stats.accel; inert for walkers):
+  heading: Vec; // unit vector x1000
+  speedMu: number; // current speed, mu/tick
+  // Artillery state (units with stats.windupTicks; inert otherwise):
+  windup: number; // barrel-raise progress in ticks; must reach windupTicks to fire
 }
 
 export type InteractAction =
@@ -121,8 +131,7 @@ export interface BuildingEnt {
   on: boolean;
   rally: Vec;
   behavior: Behavior;
-  prodTicksLeft: number; // -1 = idle (waiting for energy)
-  ready: UnitType | null; // finished unit holding in the bay for the next wave
+  starved: boolean; // couldn't afford its unit at the last wave
   targetId: number; // watchtower current target
 }
 
@@ -194,6 +203,39 @@ export interface AttackEvent {
   player: PlayerId;
 }
 
+/**
+ * An artillery shell in flight. Aimed at the target's position AT FIRE TIME —
+ * it never tracks. On arrival it airbursts: every enemy entity within the
+ * splash radius takes the stored damage (cloak is no defense against area fire).
+ */
+export interface ShellState {
+  player: PlayerId;
+  type: UnitType; // attacker unit type, for counter multipliers + kill events
+  from: Vec;
+  to: Vec;
+  ticksLeft: number;
+  ticksTotal: number;
+  dmg: number; // mHP per target before counter/defense multipliers (tech/auras baked in at fire time)
+  splashMu: number;
+  attackerId: number;
+}
+
+/** Shell fired this tick (presentation: muzzle flash + recoil). Not part of the hash. */
+export interface ShellEvent {
+  from: Vec;
+  to: Vec;
+  ticks: number;
+  attackerId: number;
+  player: PlayerId;
+}
+
+/** Airburst resolved this tick (presentation: explosion + flak). Not part of the hash. */
+export interface BurstEvent {
+  pos: Vec;
+  splashMu: number;
+  player: PlayerId;
+}
+
 const INTERACT_RANGE_MU = Math.floor(COMMANDER.interactRange * FP);
 const ARRIVE_TOLERANCE_MU = 300;
 
@@ -215,8 +257,15 @@ export class Game {
   commandLog: { tick: number; player: PlayerId; cmd: Command }[] = [];
   /** Attacks resolved in the most recent step; rewritten each tick (presentation only). */
   attackLog: AttackEvent[] = [];
+  /** Artillery shells currently in flight (sim state — part of the hash). */
+  shells: ShellState[] = [];
+  /** Shells fired / airbursts resolved in the most recent step (presentation only). */
+  shellLog: ShellEvent[] = [];
+  burstLog: BurstEvent[] = [];
   /** Debug cheat: placed buildings complete instantly. Toggling mid-match breaks replay parity. */
   debugInstantBuild = false;
+  /** Debug war-game: per-player comps spawned free at each wave, rallied at the enemy base. */
+  debugWaveComp: [Partial<Record<UnitType, number>> | null, Partial<Record<UnitType, number>> | null] = [null, null];
 
   constructor(seed: number, map?: GameMap) {
     this.seed = seed;
@@ -311,8 +360,7 @@ export class Game {
       on: true,
       rally: { ...pos },
       behavior: 'guard',
-      prodTicksLeft: -1,
-      ready: null,
+      starved: false,
       targetId: 0,
     };
     this.entities.set(b.id, b);
@@ -356,6 +404,9 @@ export class Game {
       rally: { ...fab.rally },
       behavior: fab.behavior,
       targetId: 0,
+      heading: { x: player === 0 ? 1000 : -1000, y: 0 },
+      speedMu: 0,
+      windup: 0,
       path: [],
       pathIdx: 0,
       pathGoal: null,
@@ -676,6 +727,11 @@ export class Game {
     return null;
   }
 
+  /** Debug (war-game): wipe every unit on the field, both players. */
+  debugKillAllUnits(): void {
+    for (const u of [...this.units()]) this.removeEntity(u.id);
+  }
+
   private removeEntity(id: number): void {
     const e = this.entities.get(id);
     if (!e) return;
@@ -707,6 +763,9 @@ export class Game {
     this.tickCommanders();
     this.tickProduction();
     const attacks: Attack[] = [];
+    this.shellLog = [];
+    this.burstLog = [];
+    this.tickShells(attacks); // before tickUnits: shells fired this tick fly their full time
     this.tickUnits(attacks);
     this.separateUnits();
     this.tickTowers(attacks);
@@ -878,12 +937,7 @@ export class Game {
       case 'set_production':
         if (a.unit !== undefined) {
           if (!UNIT_STATS[a.unit]) return fail('unknown unit type');
-          if (b.production !== a.unit && b.prodTicksLeft >= 0) {
-            // Changing type cancels in-progress unit, refunding its cost.
-            p.energy += UNIT_STATS[b.production].cost * FP;
-            b.prodTicksLeft = -1;
-          }
-          b.production = a.unit;
+          b.production = a.unit; // units insta-build at the wave; nothing in flight to refund
         }
         if (a.on !== undefined) b.on = a.on;
         return;
@@ -912,12 +966,12 @@ export class Game {
    * Move an entity toward a goal along an A* path.
    * Returns 'moving' | 'arrived' | 'stuck'.
    */
-  private moveEntityToward(e: UnitEnt | CommanderEnt, goal: Vec): 'moving' | 'arrived' | 'stuck' {
+  private moveEntityToward(e: UnitEnt | CommanderEnt, goal: Vec, capMu?: number): 'moving' | 'arrived' | 'stuck' {
     if (within(e.pos, goal, ARRIVE_TOLERANCE_MU)) return 'arrived';
     if (!e.pathGoal || dist2(e.pathGoal, goal) > FP * FP) {
       this.computePath(e, goal);
     }
-    let step = this.speedMuPerTick(e);
+    let step = Math.min(this.speedMuPerTick(e), capMu ?? Infinity);
     while (step > 0) {
       if (e.pathIdx >= e.path.length) {
         // Path exhausted; final approach within the goal cell.
@@ -959,34 +1013,214 @@ export class Game {
     e.pathGoal = { ...goal };
   }
 
+  // -- vehicle kinematics (units with stats.accel) --------------------------------
+  //
+  // Integer-only steering: heading is a x1000 unit vector rotated by a per-tick
+  // angle budget (small-angle sin~theta, cos~1000-theta^2/2000, renormalized via
+  // isqrt), so no float trig enters the sim. Turn budget shrinks with speed.
+
+  /** Steer toward `dir` (any magnitude) and integrate. throttle=false brakes to 0. */
+  private steerVehicle(u: UnitEnt, dir: Vec | null, throttle: boolean, capMu?: number): void {
+    const s = UNIT_STATS[u.type];
+    const maxSpd = Math.min(this.speedMuPerTick(u), capMu ?? Infinity);
+    const tps2 = TICKS_PER_SECOND * TICKS_PER_SECOND;
+    const accel = Math.max(1, Math.floor(((s.accel ?? 4) * FP) / tps2));
+    const decel = Math.max(1, Math.floor(((s.decel ?? 8) * FP) / tps2));
+
+    let aligned = 1000;
+    if (dir) {
+      const dlen = isqrt(dir.x * dir.x + dir.y * dir.y);
+      if (dlen > 0) {
+        const dx = Math.floor((dir.x * 1000) / dlen);
+        const dy = Math.floor((dir.y * 1000) / dlen);
+        // turn budget in mrad/tick, interpolated standstill -> max speed
+        const maxT = Math.min(600, Math.floor(((s.turnRate ?? 180) * 17453) / (1000 * TICKS_PER_SECOND)));
+        const minT = Math.min(maxT, Math.floor(((s.turnRateMin ?? s.turnRate ?? 180) * 17453) / (1000 * TICKS_PER_SECOND)));
+        const frac = maxSpd > 0 ? Math.min(1000, Math.floor((1000 * u.speedMu) / maxSpd)) : 0;
+        const turn = Math.max(30, maxT - Math.floor(((maxT - minT) * frac) / 1000));
+        const cross = Math.floor((u.heading.x * dy - u.heading.y * dx) / 1000); // ~1000*sin(delta)
+        const dot = Math.floor((u.heading.x * dx + u.heading.y * dy) / 1000); // ~1000*cos(delta)
+        if (dot > 0 && Math.abs(cross) <= turn) {
+          u.heading = { x: dx, y: dy }; // within budget: snap
+        } else {
+          const sign = cross > 0 ? 1 : cross < 0 ? -1 : 1;
+          const sin = turn * sign;
+          const cos = 1000 - Math.floor((turn * turn) / 2000);
+          const hx = Math.floor((u.heading.x * cos - u.heading.y * sin) / 1000);
+          const hy = Math.floor((u.heading.x * sin + u.heading.y * cos) / 1000);
+          const hl = isqrt(hx * hx + hy * hy) || 1;
+          u.heading = { x: Math.floor((hx * 1000) / hl), y: Math.floor((hy * 1000) / hl) };
+        }
+        aligned = Math.floor((u.heading.x * dx + u.heading.y * dy) / 1000);
+      }
+    }
+
+    if (!dir || !throttle) {
+      u.speedMu = Math.max(0, u.speedMu - decel);
+    } else if (aligned > 500) {
+      u.speedMu = Math.min(maxSpd, u.speedMu + accel); // roughly on line: open up
+    } else if (aligned < 0) {
+      u.speedMu = Math.max(Math.floor(maxSpd / 4), u.speedMu - decel); // way off: brake into the turn
+    } else {
+      u.speedMu = Math.max(Math.floor(maxSpd / 3), u.speedMu - Math.floor(decel / 2)); // carving
+    }
+    u.speedMu = Math.min(u.speedMu, maxSpd); // slow zones cap immediately
+
+    if (u.speedMu > 0) {
+      const nx = u.pos.x + Math.floor((u.heading.x * u.speedMu) / 1000);
+      const ny = u.pos.y + Math.floor((u.heading.y * u.speedMu) / 1000);
+      const c = posToCell({ x: nx, y: ny });
+      if (inBounds(this.map, c.cx, c.cy) && !this.blocked[cellIndex(this.map, c.cx, c.cy)]) {
+        u.pos = { x: nx, y: ny };
+      } else {
+        u.speedMu = 0; // wall/building: stall and force a repath
+        u.pathGoal = null;
+      }
+    }
+  }
+
+  /** Path-following analog of moveEntityToward for vehicles. */
+  private vehicleMoveToward(u: UnitEnt, goal: Vec, capMu?: number): 'moving' | 'arrived' {
+    if (within(u.pos, goal, ARRIVE_TOLERANCE_MU * 2)) {
+      this.steerVehicle(u, null, false); // brake
+      return 'arrived';
+    }
+    if (!u.pathGoal || dist2(u.pathGoal, goal) > FP * FP) this.computePath(u, goal);
+    // advance waypoints as we sweep near them (vehicles cut corners)
+    while (
+      u.pathIdx < u.path.length &&
+      within(u.pos, cellCenter(u.path[u.pathIdx].cx, u.path[u.pathIdx].cy), 800)
+    ) {
+      u.pathIdx++;
+    }
+    let wp = goal;
+    if (u.pathIdx < u.path.length) {
+      const next = u.path[u.pathIdx];
+      if (this.blocked[cellIndex(this.map, next.cx, next.cy)]) {
+        this.computePath(u, goal);
+        if (u.pathIdx < u.path.length) wp = cellCenter(u.path[u.pathIdx].cx, u.path[u.pathIdx].cy);
+      } else {
+        wp = cellCenter(next.cx, next.cy);
+      }
+    }
+    // ease off when the remaining distance is inside braking range
+    const s = UNIT_STATS[u.type];
+    const decel = Math.max(1, Math.floor(((s.decel ?? 8) * FP) / (TICKS_PER_SECOND * TICKS_PER_SECOND)));
+    const stopDist = Math.floor((u.speedMu * u.speedMu) / (2 * decel));
+    const throttle = dist2(u.pos, goal) > stopDist * stopDist;
+    this.steerVehicle(u, { x: wp.x - u.pos.x, y: wp.y - u.pos.y }, throttle, capMu);
+    return 'moving';
+  }
+
+  /** Skirmish: orbit the target at ~75% weapon range, always moving, guns free. */
+  private skirmish(u: UnitEnt, target: Entity, rangeMu: number): void {
+    const rel = { x: u.pos.x - target.pos.x, y: u.pos.y - target.pos.y };
+    const r = isqrt(rel.x * rel.x + rel.y * rel.y) || 1;
+    if (r > rangeMu * 2) {
+      this.vehicleMoveToward(u, target.pos); // too far: path in properly
+      return;
+    }
+    const rad = { x: Math.floor((rel.x * 1000) / r), y: Math.floor((rel.y * 1000) / r) };
+    const side = u.id % 2 === 0 ? 1 : -1; // stable orbit direction per unit
+    const tan = { x: -rad.y * side, y: rad.x * side };
+    const prefR = pm(rangeMu, 750);
+    // blend tangent with a radial correction toward the preferred ring
+    let radW = 0;
+    if (r > rangeMu) radW = -700; // outside gun range: cut in
+    else if (r < prefR) radW = 700; // too close: flare out
+    const dir = {
+      x: tan.x + Math.floor((rad.x * radW) / 1000),
+      y: tan.y + Math.floor((rad.y * radW) / 1000),
+    };
+    this.steerVehicle(u, dir, true);
+  }
+
   // -- production ----------------------------------------------------------------
 
   private tickProduction(): void {
-    // All fabricators deploy on a shared wave cycle: production runs on its own
-    // timer, but the finished unit holds in the bay until the next wave tick.
-    // (Build times exceed WAVE_INTERVAL, so at most one unit waits per bay.)
-    const waveNow = this.tick % (WAVE_INTERVAL * TICKS_PER_SECOND) === 0;
+    // Wave production: every WAVE_INTERVAL, each ON fabricator that can afford
+    // its unit insta-builds and deploys it. When energy runs short, priority is
+    // deterministic — oldest fabricator first (entity id order), greedy, so a
+    // cheaper unit later in line can still release. Starved bays are flagged.
+    if (this.tick % (WAVE_INTERVAL * TICKS_PER_SECOND) !== 0) return;
+    const starvedCount: [number, number] = [0, 0];
     for (const b of [...this.buildings()]) {
       if (b.type !== 'fabricator' || !b.done) continue;
-      if (waveNow && b.ready !== null) {
-        // deploy even if production was since switched off — the unit is paid for
-        const type = b.ready;
-        b.ready = null;
-        this.spawnUnit(b.player, type, b);
+      if (!b.on) {
+        b.starved = false;
+        continue;
       }
-      if (!b.on) continue;
       const p = this.players[b.player];
-      if (b.prodTicksLeft < 0) {
-        if (b.ready !== null) continue; // bay occupied — wait for the wave
-        const cost = UNIT_STATS[b.production].cost * FP;
-        if (p.energy >= cost) {
-          p.energy -= cost;
-          b.prodTicksLeft = UNIT_STATS[b.production].buildTime * TICKS_PER_SECOND;
-        }
-      } else if (--b.prodTicksLeft <= 0) {
-        b.prodTicksLeft = -1;
-        b.ready = b.production; // paid + built as this type; wave releases it
+      const cost = UNIT_STATS[b.production].cost * FP;
+      if (p.energy >= cost) {
+        p.energy -= cost;
+        b.starved = false;
+        this.spawnUnit(b.player, b.production, b);
+      } else {
+        b.starved = true;
+        starvedCount[b.player]++;
       }
+    }
+    for (const player of [0, 1] as PlayerId[]) {
+      if (starvedCount[player] > 0) {
+        this.event(player, `${starvedCount[player]} fabricator(s) skipped the wave — insufficient energy`);
+      }
+    }
+    this.debugSpawnWave();
+  }
+
+  /**
+   * War-game sandbox: free comps spawned in a battle formation facing the
+   * enemy base — ranks perpendicular to the march axis, tanky units (hp) in
+   * front, artillery behind — attack-moving to the enemy base.
+   */
+  private debugSpawnWave(): void {
+    for (const player of [0, 1] as PlayerId[]) {
+      const comp = this.debugWaveComp[player];
+      if (!comp) continue;
+      const home = this.bastion(player);
+      if (!home) continue;
+      const enemy = (1 - player) as PlayerId;
+      const enemyBase = this.bastion(enemy)?.pos ?? this.map.spawns[enemy].bastion;
+
+      // march axis d (x1000 unit vector) and its perpendicular p (rank axis)
+      const ax = enemyBase.x - home.pos.x;
+      const ay = enemyBase.y - home.pos.y;
+      const alen = isqrt(ax * ax + ay * ay) || 1;
+      const d = { x: Math.floor((ax * 1000) / alen), y: Math.floor((ay * 1000) / alen) };
+      const p = { x: -d.y, y: d.x };
+
+      // roster sorted tankiest-first (stable: hp desc, then name) -> front ranks
+      const roster: UnitType[] = [];
+      for (const [type, count] of Object.entries(comp) as [UnitType, number][]) {
+        if (!UNIT_STATS[type]) continue;
+        for (let i = 0; i < Math.min(count, 50); i++) roster.push(type);
+      }
+      roster.sort((a, b) => UNIT_STATS[b].hp - UNIT_STATS[a].hp || (a < b ? -1 : a > b ? 1 : 0));
+
+      const cols = Math.max(2, Math.ceil(Math.sqrt(roster.length * 2))); // wide, shallow ranks
+      const COL_MU = 1600; // lateral spacing
+      const ROW_MU = 1800; // rank spacing
+      const FRONT_MU = 5000; // first rank this far from the bastion center
+
+      roster.forEach((type, k) => {
+        const u = this.spawnUnit(player, type, home);
+        if (!u) return; // fully out of room — keep the fallback spot
+        const row = Math.floor(k / cols);
+        const lateral = Math.floor(((2 * (k % cols) - (cols - 1)) * COL_MU) / 2);
+        const forward = FRONT_MU + row * ROW_MU;
+        const slot = {
+          x: home.pos.x + Math.floor((d.x * forward + p.x * lateral) / 1000),
+          y: home.pos.y + Math.floor((d.y * forward + p.y * lateral) / 1000),
+        };
+        const cell = posToCell(slot);
+        if (inBounds(this.map, cell.cx, cell.cy) && !this.blocked[cellIndex(this.map, cell.cx, cell.cy)]) {
+          u.pos = slot;
+        }
+        u.heading = { ...d }; // vehicles roll out already facing the enemy
+        u.rally = { ...enemyBase };
+        u.behavior = 'assault';
+      });
     }
   }
 
@@ -1034,11 +1268,21 @@ export class Game {
   private tickUnit(u: UnitEnt, attacks: Attack[]): void {
     const p = this.players[u.player];
     const { behavior, rally } = this.effectiveOrders(u);
+    const vehicle = UNIT_STATS[u.type].accel !== undefined;
+    // Artillery is a stationary siege platform when engaged: it never kites
+    // and never skirmish-orbits — even if runtime tuning gives it vehicle
+    // kinematics (accel), those only apply to travel.
+    const artillery = UNIT_STATS[u.type].windupTicks !== undefined;
+
+    // Artillery barrel drifts back down unless actively aiming (the aim branch
+    // below raises it +2/tick, so raising nets +1/tick and lowering -1/tick).
+    if (u.windup > 0) u.windup--;
 
     // FALL BACK: retreat, ignore everything.
     if (p.override === 'fall_back') {
       u.targetId = 0;
-      this.moveEntityToward(u, rally);
+      if (vehicle) this.vehicleMoveToward(u, rally);
+      else this.moveEntityToward(u, rally);
       return;
     }
 
@@ -1058,9 +1302,26 @@ export class Game {
         }
       }
       if (nearest) {
-        u.targetId = 0;
-        this.kiteAway(u, nearest.pos);
-        return;
+        if (artillery) {
+          // Artillery never kites — it can't outrun anything that dives it.
+          // With a target left in its firing band it digs in and shells over
+          // the diver's head; otherwise it halts and waits for the dead zone
+          // to clear (the barrel drifts back down meanwhile).
+          const hasStandoff = enemies.some((e) => {
+            const d = dist2(u.pos, e.pos);
+            return d >= minRangeMu * minRangeMu && d <= rangeMu * rangeMu;
+          });
+          if (!hasStandoff) {
+            u.targetId = 0;
+            if (vehicle) this.steerVehicle(u, null, false); // roll to a stop
+            return;
+          }
+          // fall through: acquire a band target and keep firing
+        } else {
+          u.targetId = 0;
+          this.kiteAway(u, nearest.pos, rally);
+          return;
+        }
       }
     }
 
@@ -1072,6 +1333,9 @@ export class Game {
     }
     if (target && behavior === 'hold' && dist2(u.pos, target.pos) > rangeMu * rangeMu) {
       target = null; // hold never chases
+    }
+    if (target && minRangeMu > 0 && dist2(u.pos, target.pos) < minRangeMu * minRangeMu) {
+      target = null; // inside the dead zone: pick something we can actually hit
     }
 
     // Acquire a new target if needed.
@@ -1085,7 +1349,14 @@ export class Game {
       if (d2 <= rangeMu * rangeMu) {
         // burst weapons volley every burstTicks (staggered per unit id), dps preserved
         const cycle = Math.max(1, Math.round(UNIT_STATS[u.type].burstTicks ?? 1));
-        if ((this.tick + u.id) % cycle === 0) {
+        const windupTicks = UNIT_STATS[u.type].windupTicks;
+        if (windupTicks && UNIT_STATS[u.type].splashRadius) {
+          // artillery: raise the barrel first, then lob shells on the burst cycle
+          u.windup = Math.min(windupTicks, u.windup + 2);
+          if (u.windup >= windupTicks && (this.tick + u.id) % cycle === 0) {
+            this.fireShell(u, target, cycle);
+          }
+        } else if ((this.tick + u.id) % cycle === 0) {
           attacks.push({
             targetId: target.id,
             dmg: this.computeDamage(u, target) * cycle,
@@ -1096,12 +1367,20 @@ export class Game {
             attackerId: u.id,
           });
         }
-      } else if (behavior !== 'hold') {
+      } else if (behavior !== 'hold' && !vehicle) {
         // Chase (repath periodically or when the target strays from our path goal).
         if (!u.pathGoal || dist2(u.pathGoal, target.pos) > 4 * FP * FP || (this.tick + u.id) % 10 === 0) {
           this.computePath(u, target.pos);
         }
         this.moveEntityToward(u, target.pos);
+      }
+      // Vehicles never stand and shoot: keep circling the target, guns free.
+      // Except artillery — a siege platform brakes and fires from standstill
+      // (vehicle kinematics, if tuned on, only govern its travel).
+      if (vehicle) {
+        if (!artillery) this.skirmish(u, target, rangeMu);
+        else if (behavior !== 'hold' && d2 > rangeMu * rangeMu) this.vehicleMoveToward(u, target.pos);
+        else this.steerVehicle(u, null, false);
       }
       return;
     }
@@ -1109,12 +1388,59 @@ export class Game {
     // No target: behavior movement.
     if (behavior === 'hunt') {
       const known = this.nearestKnownEnemy(u);
-      this.moveEntityToward(u, known);
+      if (vehicle) this.vehicleMoveToward(u, known);
+      else this.moveEntityToward(u, known);
       return;
     }
-    if (!within(u.pos, rally, FP)) {
-      this.moveEntityToward(u, rally);
+    // Assault formations hold cohesion until contact: leaders throttle to the
+    // group's slowest member so mixed comps hit the line together.
+    let cap: number | undefined;
+    if (behavior === 'assault' && !this.enemyNear(u, enemies)) {
+      cap = this.cohesionCap(u, rally) ?? undefined;
     }
+    if (!within(u.pos, rally, FP)) {
+      if (vehicle) this.vehicleMoveToward(u, rally, cap);
+      else this.moveEntityToward(u, rally, cap);
+    } else if (vehicle) {
+      this.steerVehicle(u, null, false); // parked: bleed off speed
+    }
+  }
+
+  private enemyNear(u: UnitEnt, enemies: Entity[]): boolean {
+    const r = COHESION_BREAK_RANGE * FP;
+    for (const e of enemies) {
+      if (within(u.pos, e.pos, r)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Speed cap for an assault unit ahead of its marching group, or null for
+   * full speed (alone, behind the pack, or a groupmate is already fighting).
+   */
+  private cohesionCap(u: UnitEnt, rally: Vec): number | null {
+    const R = COHESION_RADIUS * FP;
+    let n = 0;
+    let cx = 0;
+    let cy = 0;
+    let slowest = UNIT_STATS[u.type].speed;
+    for (const v of this.units(u.player)) {
+      if (v.id === u.id || v.behavior !== 'assault') continue;
+      if (!within(v.pos, u.pos, R)) continue;
+      if (!within(v.rally, rally, 3 * FP)) continue; // marching somewhere else
+      if (v.targetId !== 0) return null; // a groupmate engaged: charge
+      n++;
+      cx += v.pos.x;
+      cy += v.pos.y;
+      if (UNIT_STATS[v.type].speed < slowest) slowest = UNIT_STATS[v.type].speed;
+    }
+    if (n === 0) return null;
+    const centroid = { x: Math.floor(cx / n), y: Math.floor(cy / n) };
+    const aheadBy = dist(centroid, rally) - dist(u.pos, rally);
+    if (aheadBy <= COHESION_SLACK * FP) return null; // in or behind the pack
+    // slightly under the slowest pace, so the pack compresses rather than
+    // holding whatever stretch it already has (slow zones etc. open gaps)
+    return pm(Math.floor(slowest * 100), 850);
   }
 
   private acquireTarget(
@@ -1131,19 +1457,19 @@ export class Game {
         zone = (e) => within(e.pos, rally, GUARD_ENGAGE_RADIUS * FP);
         break;
       case 'assault':
-        zone = (e) => within(e.pos, u.pos, UNIT_STATS[u.type].vision * FP);
+        // Engage what's around us — or, for weapons that outrange our own
+        // vision (artillery), anything the TEAM has eyes on within gun range.
+        zone = (e) => within(e.pos, u.pos, Math.max(UNIT_STATS[u.type].vision * FP, rangeMu));
         break;
       case 'hold':
-        zone = (e) => {
-          const d = dist2(u.pos, e.pos);
-          return d <= rangeMu * rangeMu && d >= minRangeMu * minRangeMu;
-        };
+        zone = (e) => dist2(u.pos, e.pos) <= rangeMu * rangeMu;
         break;
       case 'hunt':
         zone = () => true;
         break;
     }
-    const candidates = enemies.filter(zone);
+    // Never pick anything inside the weapon's dead zone.
+    const candidates = enemies.filter((e) => zone(e) && dist2(u.pos, e.pos) >= minRangeMu * minRangeMu);
     if (candidates.length === 0) return null;
 
     // Prefer countered targets among those already in weapon range; otherwise nearest.
@@ -1166,12 +1492,64 @@ export class Game {
     return best;
   }
 
-  private kiteAway(u: UnitEnt, threat: Vec): void {
-    const dx = u.pos.x - threat.x;
-    const dy = u.pos.y - threat.y;
-    const d = Math.max(1, dist(u.pos, threat));
+  /**
+   * Retreat from a threat without abandoning the advance corridor. The lane
+   * is the segment home anchor -> rally (anchor = source fabricator, else
+   * bastion, else spawn). Retreat pulls toward a point KITE_LANE_BACKSTEP
+   * down the lane from the unit's projection onto it — which both backs it
+   * up AND reels lateral drift back in — bent by the threat. Any step that
+   * would widen the lateral offset past KITE_CORRIDOR is replaced by a move
+   * straight back to the lane, so orbiting chasers can't herd units to the
+   * map edge.
+   */
+  private kiteAway(u: UnitEnt, threat: Vec, rally: Vec): void {
     const step = this.speedMuPerTick(u);
-    const target = { x: u.pos.x + Math.floor((dx * step) / d), y: u.pos.y + Math.floor((dy * step) / d) };
+    // Away from the threat, x1000 unit vector.
+    const ad = Math.max(1, dist(u.pos, threat));
+    const ax = Math.floor(((u.pos.x - threat.x) * 1000) / ad);
+    const ay = Math.floor(((u.pos.y - threat.y) * 1000) / ad);
+    let dx = ax;
+    let dy = ay;
+
+    const src = this.building(u.sourceBuilding);
+    const bastion = this.bastion(u.player);
+    const anchor = (src ?? bastion)?.pos ?? this.map.spawns[u.player].bastion;
+    const lx = rally.x - anchor.x;
+    const ly = rally.y - anchor.y;
+    const len2 = lx * lx + ly * ly;
+    let laneReturn: Vec | null = null;
+    if (len2 > 0) {
+      // Unit's projection onto the lane (t per-mille), stepped back toward home.
+      const t = clamp(Math.floor((((u.pos.x - anchor.x) * lx + (u.pos.y - anchor.y) * ly) * 1000) / len2), 0, 1000);
+      const laneLen = Math.max(1, isqrt(len2));
+      const rt = Math.max(0, t - Math.floor((KITE_LANE_BACKSTEP * FP * 1000) / laneLen));
+      laneReturn = { x: anchor.x + Math.floor((lx * rt) / 1000), y: anchor.y + Math.floor((ly * rt) / 1000) };
+      const rd = dist(u.pos, laneReturn);
+      if (rd > FP) {
+        const rx = Math.floor(((laneReturn.x - u.pos.x) * 1000) / rd);
+        const ry = Math.floor(((laneReturn.y - u.pos.y) * 1000) / rd);
+        // Blend lane-return with threat avoidance — unless they strongly
+        // oppose (threat sits down-lane), then dodge away instead.
+        const dot = Math.floor((ax * rx + ay * ry) / 1000);
+        if (dot > -500) {
+          dx = Math.floor((ax * 400 + rx * 600) / 1000);
+          dy = Math.floor((ay * 400 + ry * 600) / 1000);
+        }
+      }
+    }
+
+    const d = isqrt(dx * dx + dy * dy);
+    if (d === 0) return;
+    let target = { x: u.pos.x + Math.floor((dx * step) / d), y: u.pos.y + Math.floor((dy * step) / d) };
+
+    // Hard corridor limit: never widen the gap past KITE_CORRIDOR.
+    if (laneReturn && len2 > 0) {
+      const latNow = this.laneOffset(u.pos, anchor, lx, ly, len2);
+      const latNew = this.laneOffset(target, anchor, lx, ly, len2);
+      if (latNew > KITE_CORRIDOR * FP && latNew > latNow) {
+        target = stepToward(u.pos, laneReturn, step);
+      }
+    }
     const cell = posToCell(target);
     if (!inBounds(this.map, cell.cx, cell.cy)) return;
     const fromIdx = cellIndex(this.map, posToCell(u.pos).cx, posToCell(u.pos).cy);
@@ -1187,6 +1565,13 @@ export class Game {
     u.path = [];
     u.pathIdx = 0;
     u.pathGoal = null;
+  }
+
+  /** Lateral distance (mu) from p to the anchor->rally lane segment. */
+  private laneOffset(p: Vec, anchor: Vec, lx: number, ly: number, len2: number): number {
+    const t = clamp(Math.floor((((p.x - anchor.x) * lx + (p.y - anchor.y) * ly) * 1000) / len2), 0, 1000);
+    const c = { x: anchor.x + Math.floor((lx * t) / 1000), y: anchor.y + Math.floor((ly * t) / 1000) };
+    return dist(p, c);
   }
 
   private nearestKnownEnemy(u: UnitEnt): Vec {
@@ -1212,6 +1597,67 @@ export class Game {
     return dmg;
   }
 
+  // -- artillery shells -----------------------------------------------------------
+
+  /** Lob an airburst shell at the target's CURRENT position; it will not track. */
+  private fireShell(u: UnitEnt, target: Entity, cycle: number): void {
+    const s = UNIT_STATS[u.type];
+    // Per-shell base damage (dps preserved over the burst cycle). Attacker-side
+    // bonuses are baked in at fire time; per-target multipliers apply at burst.
+    let dmg = s.dps * 100 * cycle;
+    if (this.players[u.player].techs.has('mil2')) dmg = pm(dmg, FOCUSED_OPTICS_DAMAGE);
+    if (this.hasPointAura(u.player, u.pos, 'targeting_aura')) dmg = pm(dmg, TARGETING_AURA_DAMAGE);
+    const muPerTick = Math.max(1, Math.floor((s.shellSpeed! * FP) / TICKS_PER_SECOND));
+    const ticks = Math.max(1, Math.ceil(dist(u.pos, target.pos) / muPerTick));
+    this.shells.push({
+      player: u.player,
+      type: u.type,
+      from: { ...u.pos },
+      to: { ...target.pos },
+      ticksLeft: ticks,
+      ticksTotal: ticks,
+      dmg,
+      splashMu: Math.floor((s.splashRadius ?? 1) * FP),
+      attackerId: u.id,
+    });
+    this.shellLog.push({ from: { ...u.pos }, to: { ...target.pos }, ticks, attackerId: u.id, player: u.player });
+  }
+
+  /** Advance in-flight shells; on arrival, airburst: flak every enemy in the splash. */
+  private tickShells(attacks: Attack[]): void {
+    if (this.shells.length === 0) return;
+    const inFlight: ShellState[] = [];
+    for (const sh of this.shells) {
+      sh.ticksLeft--;
+      if (sh.ticksLeft > 0) {
+        inFlight.push(sh);
+        continue;
+      }
+      this.burstLog.push({ pos: { ...sh.to }, splashMu: sh.splashMu, player: sh.player });
+      for (const e of this.entities.values()) {
+        if (e.player === sh.player) continue;
+        const hit =
+          e.kind === 'building'
+            ? this.dist2ToBuilding(sh.to, e) <= sh.splashMu * sh.splashMu
+            : within(e.pos, sh.to, sh.splashMu);
+        if (!hit) continue;
+        // No high-ground or cloak checks: lobbed area fire hits whatever is under the burst.
+        let dmg = pm(sh.dmg, this.counterMult(sh.type, e));
+        if (e.kind !== 'building') dmg = pm(dmg, this.damageTakenMult(e));
+        attacks.push({
+          targetId: e.id,
+          dmg,
+          attackerDesc: `enemy ${sh.type}`,
+          attackerPos: sh.to,
+          attackerType: sh.type,
+          attackerPlayer: sh.player,
+          attackerId: sh.attackerId,
+        });
+      }
+    }
+    this.shells = inFlight;
+  }
+
   /**
    * Soft flocking (§7): friendly units repel each other slightly so groups
    * clump loosely instead of stacking on one point. Deterministic: pairs in
@@ -1219,13 +1665,14 @@ export class Game {
    */
   private separateUnits(): void {
     const units = [...this.units()];
-    const R = 800; // mu — desired minimum spacing
     const MAX_PUSH = 120; // mu per tick
     for (let i = 0; i < units.length; i++) {
       for (let j = i + 1; j < units.length; j++) {
         const a = units[i];
         const b = units[j];
         if (a.player !== b.player) continue;
+        // desired spacing = sum of body radii (big hulls like kumo/oni need room)
+        const R = Math.floor(((UNIT_STATS[a.type].radius ?? 0.4) + (UNIT_STATS[b.type].radius ?? 0.4)) * FP);
         const d2 = dist2(a.pos, b.pos);
         if (d2 >= R * R) continue;
         const d = isqrt(d2);
@@ -1489,12 +1936,12 @@ export class Game {
   stateHash(): string {
     const ents = [...this.entities.values()].map((e) => {
       if (e.kind === 'unit') {
-        return ['u', e.id, e.player, e.type, e.pos.x, e.pos.y, e.hp, e.targetId, e.behavior];
+        return ['u', e.id, e.player, e.type, e.pos.x, e.pos.y, e.hp, e.targetId, e.behavior, e.heading.x, e.heading.y, e.speedMu, e.windup];
       }
       if (e.kind === 'commander') {
         return ['c', e.id, e.player, e.pos.x, e.pos.y, e.hp, e.tasks.length, e.stillTicks];
       }
-      return ['b', e.id, e.player, e.type, e.pos.x, e.pos.y, e.hp, e.done ? 1 : 0, e.buildTicks, e.prodTicksLeft, e.ready ?? '', e.on ? 1 : 0];
+      return ['b', e.id, e.player, e.type, e.pos.x, e.pos.y, e.hp, e.done ? 1 : 0, e.buildTicks, e.starved ? 1 : 0, e.on ? 1 : 0];
     });
     const players = this.players.map((p) => [
       p.energy,
@@ -1503,6 +1950,7 @@ export class Game {
       p.override,
     ]);
     const cps = this.capturePoints.map((cp) => [cp.id, cp.owner, cp.meterSide, cp.meter, cp.buffs]);
-    return JSON.stringify([this.tick, players, cps, ents, this.prng.serialize()]);
+    const shells = this.shells.map((s) => [s.player, s.type, s.from.x, s.from.y, s.to.x, s.to.y, s.ticksLeft, s.dmg, s.splashMu]);
+    return JSON.stringify([this.tick, players, cps, ents, shells, this.prng.serialize()]);
   }
 }

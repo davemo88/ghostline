@@ -6,6 +6,7 @@
 
 import {
   BUILDING_STATS,
+  COHESION_BREAK_RANGE,
   COMMANDER,
   COUNTER,
   FP,
@@ -15,12 +16,15 @@ import {
   type UnitType,
   WAVE_INTERVAL,
 } from '../sim';
-const UNIT_TYPES: UnitType[] = ['ronin', 'oni', 'mantis', 'wasp', 'kumo'];
+const UNIT_TYPES: UnitType[] = ['ronin', 'oni', 'mantis', 'wasp', 'kumo', 'kaze', 'taiko'];
 
 function unitTable(): string {
   const rows = UNIT_TYPES.map((t) => {
     const s = UNIT_STATS[t];
-    return `${t}: ${s.cost}e ${s.buildTime}s | ${s.hp}hp ${s.dps}dps rng${s.range}${s.minRange ? `(min${s.minRange})` : ''} spd${s.speed} vis${s.vision}`;
+    const arty = s.windupTicks
+      ? ` | ARTILLERY: airburst splash r${s.splashRadius} (hits cloaked), ${s.windupTicks / 10}s barrel-raise before firing, 1 shell/${(s.burstTicks ?? 1) / 10}s, shells take flight time and land where the target WAS at fire time — moving targets dodge, clumps and buildings don't. Never retreats: keeps shelling while anything is in its firing band, and stands helpless against enemies inside min range — screen it, or counter it by diving inside min${s.minRange}`
+      : '';
+    return `${t}: ${s.cost}e | ${s.hp}hp ${s.dps}dps rng${s.range}${s.minRange ? `(min${s.minRange})` : ''} spd${s.speed} vis${s.vision}${arty}`;
   });
   return rows.join('\n');
 }
@@ -83,7 +87,7 @@ ${counterTable()}
 BUILDINGS:
 ${buildingTable()}
 
-FABRICATORS produce ONE unit type continuously while ON (repeat: wait for cost -> build -> hold in bay). All bays deploy together on a shared ${WAVE_INTERVAL}s wave cycle (both players' waves are simultaneous). Units inherit the fabricator's rally point + behavior and follow live changes to them. Behaviors: guard (fight within 15 of rally, leash 10), assault (attack-move to rally), hold (never chase), hunt (seek nearest known enemy anywhere).
+FABRICATORS: every ${WAVE_INTERVAL}s the wave fires (both players simultaneously) — each ON fabricator that can afford its unit's cost instantly builds and deploys it. Energy is the only throttle. When energy is short, OLDEST fabricators get funded first (greedy: a cheaper unit later in line can still release); skipped ones are flagged skippedLastWave. Units inherit the fabricator's rally point + behavior and follow live changes to them. Behaviors: guard (fight within 15 of rally, leash 10), assault (attack-move to rally; holds formation pace with nearby groupmates until enemies are within ${COHESION_BREAK_RANGE}), hold (never chase), hunt (seek nearest known enemy anywhere).
 
 GLOBAL OVERRIDE (Commander at Bastion): fall_back (all units retreat, no fighting) / defend (all guard the Bastion) / release.
 
@@ -103,7 +107,7 @@ COMMANDS (respond with a JSON object {memo, commands}). Commands queue in order;
 - {"cmd":"repair","building":id}
 - {"cmd":"set_rally","building":id,"pos":[x,y]}
 - {"cmd":"set_behavior","building":id,"behavior":"guard|assault|hold|hunt"}
-- {"cmd":"set_production","building":id,"unit":"ronin|oni|mantis|wasp|kumo","on":true}
+- {"cmd":"set_production","building":id,"unit":"ronin|oni|mantis|wasp|kumo|kaze|taiko","on":true}
 - {"cmd":"research","tech":"eco1|...|cmd3"}
 - {"cmd":"global_override","stance":"fall_back|defend|release"}
 

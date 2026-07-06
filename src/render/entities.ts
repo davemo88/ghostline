@@ -8,11 +8,16 @@ import {
   BUILDING_STATS,
   type BuildingEnt,
   type BuildingType,
+  type BurstEvent,
   CAPTURE_RADIUS,
   type CommanderEnt,
   type Entity,
   FP,
   type Game,
+  type ShellEvent,
+  type ShellState,
+  UNIT_STATS,
+  type UnitEnt,
   type UnitType,
   posToCell,
 } from '../sim';
@@ -35,6 +40,10 @@ function unitGeometry(type: UnitType): THREE.BufferGeometry {
       return new THREE.OctahedronGeometry(0.4);
     case 'kumo':
       return new THREE.BoxGeometry(0.9, 0.5, 1.2); // unused — kumo builds a rigged group
+    case 'kaze':
+      return new THREE.BoxGeometry(0.3, 0.5, 1.2); // unused — kaze builds a rigged group
+    case 'taiko':
+      return new THREE.BoxGeometry(1.1, 0.6, 1.6); // unused — taiko builds a rigged group
   }
 }
 
@@ -55,13 +64,32 @@ function setEmissive(obj: THREE.Object3D, boost: number | null): void {
 
 interface KumoRig {
   root: THREE.Group;
-  legs: { hip: THREE.Group; side: number; parity: number }[];
+  legs: { hip: THREE.Group; side: number; parity: number; baseYaw: number }[];
   body: THREE.Mesh;
   head: THREE.Group;
   muzzles: THREE.Object3D[];
   yaw: number;
   phase: number;
   amp: number; // gait blend 0..1 (eases in/out of walking)
+}
+
+interface KazeRig {
+  root: THREE.Group;
+  frame: THREE.Group; // everything leans (rolls) with this
+  axles: THREE.Group[]; // wheel spin
+  yaw: number;
+  lean: number;
+}
+
+interface TaikoRig {
+  root: THREE.Group;
+  turret: THREE.Group; // yaws toward the target
+  barrel: THREE.Group; // pitches up with the sim's windup counter
+  barrelMesh: THREE.Mesh; // slides back on recoil
+  muzzle: THREE.Object3D;
+  yaw: number; // hull facing
+  pitch: number; // smoothed barrel elevation
+  recoil: number; // barrel kickback, decays per frame
 }
 
 function buildingGeometry(type: BuildingType): THREE.BufferGeometry {
@@ -81,19 +109,30 @@ function buildingGeometry(type: BuildingType): THREE.BufferGeometry {
   }
 }
 
-const HOVER: Record<UnitType, number> = { ronin: 0.6, oni: 0.55, mantis: 1.0, wasp: 1.5, kumo: 0.02 };
+const HOVER: Record<UnitType, number> = { ronin: 0.6, oni: 0.55, mantis: 1.0, wasp: 1.5, kumo: 0.02, kaze: 0.02, taiko: 0.02 };
 
 // shared projectile resources (one geometry, one material per team)
 const SHOT_GEO = new THREE.SphereGeometry(0.16, 6, 4);
 const SHOT_MAT = TEAM.map((c) => new THREE.MeshBasicMaterial({ color: c }));
 
+// artillery shell + airburst
+const SHELL_GEO = new THREE.SphereGeometry(0.2, 6, 4);
+const SHELL_MAT = new THREE.MeshBasicMaterial({ color: '#ffd27f' });
+const BURST_H = 4.0; // airburst height above the ground (world units)
+const BARREL_PITCH_MIN = 0.1; // rad, stowed
+const BARREL_PITCH_MAX = 1.05; // rad, fully raised
+
 export class EntityLayer {
   readonly group = new THREE.Group();
   private meshes = new Map<number, THREE.Object3D>();
   private kumoRigs = new Map<number, KumoRig>();
+  private kazeRigs = new Map<number, KazeRig>();
+  private taikoRigs = new Map<number, TaikoRig>();
+  private shellMeshes = new Map<ShellState, THREE.Mesh>(); // live sim shells -> arcing meshes
   private hitFlash = new Map<number, number>(); // entity id -> frames of impact glow left
   private bars = new Map<number, THREE.Sprite>();
   private progress = new Map<number, { bg: THREE.Sprite; fill: THREE.Sprite }>();
+  private starveMarks = new Map<number, THREE.Sprite>(); // red pulse over starved fabricators
   private beams = new Map<number, THREE.Line>();
   private ghosts = new Map<number, THREE.Mesh>();
   private cpRings: { ring: THREE.Mesh; beacon: THREE.Mesh }[] = [];
@@ -186,6 +225,10 @@ export class EntityLayer {
     if (e.kind === 'unit') {
       if (e.type === 'kumo') {
         mesh = this.buildKumo(e.id, e.player);
+      } else if (e.type === 'kaze') {
+        mesh = this.buildKaze(e.id, e.player);
+      } else if (e.type === 'taiko') {
+        mesh = this.buildTaiko(e.id, e.player);
       } else {
         mesh = new THREE.Mesh(
           unitGeometry(e.type),
@@ -232,50 +275,188 @@ export class EntityLayer {
     body.position.y = 0.78;
     root.add(body);
 
-    // head: bright dome up front with two gunmetal MG barrels; muzzles marked for flashes
+    // head: pod slung below the hull's front lip on an articulated neck; the whole
+    // group yaws around the neck pivot so the pod swings when tracking targets
     const head = new THREE.Group();
-    head.position.set(0, 1.02, 0.42);
-    head.add(new THREE.Mesh(new THREE.SphereGeometry(0.3, 8, 6), mat('#8b96a5', 1.25)));
+    head.position.set(0, 0.62, 0.55); // neck pivot at the front-bottom edge of the hull
+    const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.055, 0.075, 0.36, 6), mat('#1b1f24', 0.35));
+    neck.position.set(0, -0.13, 0.09);
+    neck.rotation.x = 0.55; // rakes down and forward
+    head.add(neck);
+    const pod = new THREE.Mesh(new THREE.SphereGeometry(0.3, 8, 6), mat('#8b96a5', 1.25));
+    pod.position.set(0, -0.26, 0.2);
+    head.add(pod);
     const muzzles: THREE.Object3D[] = [];
     for (const side of [-1, 1]) {
       const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.06, 0.55, 5), mat('#1b1f24', 0.25));
       barrel.rotation.x = Math.PI / 2; // point along +z (facing)
-      barrel.position.set(side * 0.17, 0.12, 0.3);
+      barrel.position.set(side * 0.17, -0.18, 0.48);
       head.add(barrel);
       const muzzle = new THREE.Object3D();
-      muzzle.position.set(side * 0.17, 0.12, 0.6);
+      muzzle.position.set(side * 0.17, -0.18, 0.78);
       head.add(muzzle);
       muzzles.push(muzzle);
     }
     root.add(head);
 
-    // six legs, arched spider-style: upper segment out+up, lower down to the ground
+    // six legs, two segments: short upper straight out from the hull parallel to the
+    // ground, lower at an obtuse knee angle splaying out+down to the ground. Rest
+    // yaw splays front legs forward and rear legs back (that splay is also the
+    // stride's yaw limit); middle legs sit dead perpendicular.
+    const legSplay = 0.35; // rad, front/rear rest yaw about y
+    const kneeTilt = 0.4; // rad from vertical, keeps the knee angle obtuse
     const legs: KumoRig['legs'] = [];
     for (let i = 0; i < 6; i++) {
       const side = i < 3 ? -1 : 1;
-      const row = i % 3;
+      const row = i % 3; // 0 rear, 1 middle, 2 front
       const hip = new THREE.Group();
-      hip.position.set(side * 0.45, 0.72, (row - 1) * 0.48);
-      const upper = new THREE.Mesh(new THREE.BoxGeometry(0.085, 0.5, 0.085), mat());
-      upper.position.set(side * 0.21, 0.12, 0);
-      upper.rotation.z = -side * 1.05;
+      hip.position.set(side * 0.45, 0.62, (row - 1) * 0.48);
+      const baseYaw = -side * legSplay * (row - 1);
+      hip.rotation.y = baseYaw;
+      const upper = new THREE.Mesh(new THREE.BoxGeometry(0.38, 0.14, 0.14), mat());
+      upper.position.set(side * 0.19, 0, 0);
       hip.add(upper);
-      const lower = new THREE.Mesh(new THREE.BoxGeometry(0.055, 0.95, 0.055), mat());
-      lower.position.set(side * 0.5, -0.22, 0);
-      lower.rotation.z = -side * 0.16;
+      const lower = new THREE.Mesh(new THREE.BoxGeometry(0.11, 0.68, 0.11), mat());
+      lower.position.set(side * (0.38 + 0.34 * Math.sin(kneeTilt)), -0.34 * Math.cos(kneeTilt), 0);
+      lower.rotation.z = side * kneeTilt;
       hip.add(lower);
       root.add(hip);
       // tripod gait: front+back of one side step with the middle of the other
-      legs.push({ hip, side, parity: (row + (side === 1 ? 1 : 0)) % 2 });
+      legs.push({ hip, side, parity: (row + (side === 1 ? 1 : 0)) % 2, baseYaw });
     }
 
     this.kumoRigs.set(id, { root, legs, body, head, muzzles, yaw: 0, phase: (id % 7) * 0.9, amp: 0 });
     return root;
   }
 
-  /** Tripod-gait walk cycle + facing; idles with a head scan. */
-  private animateKumo(id: number, dx: number, dy: number): void {
-    const rig = this.kumoRigs.get(id);
+  /** Skirmish bike: low frame between two wheels, tucked rider, bright tank. */
+  private buildKaze(id: number, player: number): THREE.Group {
+    const mat = (color: THREE.ColorRepresentation = BODY, glow = 0.85): THREE.MeshLambertMaterial => {
+      const m = new THREE.MeshLambertMaterial({ color, emissive: TEAM[player], emissiveIntensity: glow });
+      m.userData.baseEmissive = glow;
+      return m;
+    };
+    const root = new THREE.Group();
+    const frame = new THREE.Group(); // leans as one piece
+    root.add(frame);
+
+    const body = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.24, 1.15), mat());
+    body.position.y = 0.52;
+    const tank = new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.18, 0.4), mat('#8b96a5', 1.25));
+    tank.position.set(0, 0.68, 0.15);
+    const rider = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.34, 0.42), mat('#1b1f24', 0.35));
+    rider.position.set(0, 0.82, -0.15);
+    rider.rotation.x = 0.35; // tucked forward
+    const bars = new THREE.Mesh(new THREE.BoxGeometry(0.44, 0.05, 0.05), mat('#1b1f24', 0.35));
+    bars.position.set(0, 0.76, 0.42);
+    frame.add(body, tank, rider, bars);
+
+    const axles: THREE.Group[] = [];
+    for (const z of [0.55, -0.48]) {
+      const axle = new THREE.Group();
+      axle.position.set(0, 0.3, z);
+      const wheel = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.3, 0.09, 10), mat('#1b1f24', 0.3));
+      wheel.rotation.z = Math.PI / 2; // axle along x
+      axle.add(wheel);
+      frame.add(axle);
+      axles.push(axle);
+    }
+
+    this.kazeRigs.set(id, { root, frame, axles, yaw: 0, lean: 0 });
+    return root;
+  }
+
+  /** Artillery tank: low tracked hull, turret, one oversized barrel on a rear pivot. */
+  private buildTaiko(id: number, player: number): THREE.Group {
+    const mat = (color: THREE.ColorRepresentation = BODY, glow = 0.85): THREE.MeshLambertMaterial => {
+      const m = new THREE.MeshLambertMaterial({ color, emissive: TEAM[player], emissiveIntensity: glow });
+      m.userData.baseEmissive = glow;
+      return m;
+    };
+    const root = new THREE.Group();
+
+    // hull between two dark track blocks
+    const hull = new THREE.Mesh(new THREE.BoxGeometry(0.85, 0.4, 1.5), mat());
+    hull.position.y = 0.48;
+    root.add(hull);
+    for (const side of [-1, 1]) {
+      const track = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.34, 1.7), mat('#1b1f24', 0.3));
+      track.position.set(side * 0.55, 0.24, 0);
+      root.add(track);
+    }
+
+    // turret: bright block, yaws to face the target
+    const turret = new THREE.Group();
+    turret.position.set(0, 0.78, -0.15);
+    turret.add(new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.34, 0.7), mat('#8b96a5', 1.15)));
+
+    // barrel group pivots at the turret front; the big gun lifts before firing
+    const barrel = new THREE.Group();
+    barrel.position.set(0, 0.16, 0.2);
+    const barrelMesh = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.1, 1.7, 6), mat('#1b1f24', 0.25));
+    barrelMesh.rotation.x = Math.PI / 2; // point along +z
+    barrelMesh.position.z = 0.75;
+    barrel.add(barrelMesh);
+    const counterweight = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.22, 0.3), mat('#1b1f24', 0.35));
+    counterweight.position.z = -0.2;
+    barrel.add(counterweight);
+    const muzzle = new THREE.Object3D();
+    muzzle.position.z = 1.6;
+    barrel.add(muzzle);
+    barrel.rotation.x = -BARREL_PITCH_MIN;
+    turret.add(barrel);
+    root.add(turret);
+
+    this.taikoRigs.set(id, { root, turret, barrel, barrelMesh, muzzle, yaw: 0, pitch: BARREL_PITCH_MIN, recoil: 0 });
+    return root;
+  }
+
+  /** Hull faces the move direction; turret tracks the target; barrel pitch follows sim windup. */
+  private animateTaiko(e: UnitEnt, game: Game, dx: number, dy: number): void {
+    const rig = this.taikoRigs.get(e.id);
+    if (!rig) return;
+    if (dx !== 0 || dy !== 0) {
+      const want = Math.atan2(dx, dy);
+      const d = Math.atan2(Math.sin(want - rig.yaw), Math.cos(want - rig.yaw));
+      rig.yaw += d * 0.12; // heavy vehicle: slow hull slew
+    }
+    rig.root.rotation.y = rig.yaw;
+
+    // turret: track the live target, else eyes front
+    const tgt = e.targetId ? game.entities.get(e.targetId) : undefined;
+    const want = tgt ? Math.atan2(tgt.pos.x - e.pos.x, tgt.pos.y - e.pos.y) - rig.yaw : 0;
+    const dt = Math.atan2(Math.sin(want - rig.turret.rotation.y), Math.cos(want - rig.turret.rotation.y));
+    rig.turret.rotation.y += dt * 0.15;
+
+    // barrel elevation is authoritative from the sim: windup 0 = stowed, full = raised
+    const wt = UNIT_STATS[e.type].windupTicks ?? 1;
+    const target = BARREL_PITCH_MIN + (BARREL_PITCH_MAX - BARREL_PITCH_MIN) * Math.min(1, e.windup / wt);
+    rig.pitch += (target - rig.pitch) * 0.15;
+    rig.barrel.rotation.x = -rig.pitch;
+    rig.recoil *= 0.82;
+    rig.barrelMesh.position.z = 0.75 - rig.recoil;
+  }
+
+  /** Orient to the sim heading, lean into turns, spin wheels with speed. */
+  private animateKaze(e: UnitEnt): void {
+    const rig = this.kazeRigs.get(e.id);
+    if (!rig) return;
+    const want = Math.atan2(e.heading.x, e.heading.y);
+    const d = Math.atan2(Math.sin(want - rig.yaw), Math.cos(want - rig.yaw));
+    rig.yaw += d * 0.35;
+    rig.root.rotation.y = rig.yaw;
+    // lean into the turn, harder at speed
+    const maxSpd = Math.max(1, UNIT_STATS.kaze.speed * 100);
+    const speedFrac = Math.min(1, e.speedMu / maxSpd);
+    const targetLean = THREE.MathUtils.clamp(-d * 9 * (0.25 + speedFrac), -0.6, 0.6);
+    rig.lean += (targetLean - rig.lean) * 0.2;
+    rig.frame.rotation.z = rig.lean;
+    for (const a of rig.axles) a.rotation.x += e.speedMu / 350; // wheel spin
+  }
+
+  /** Tripod-gait walk cycle + facing; head tracks the current target. */
+  private animateKumo(e: UnitEnt, game: Game, dx: number, dy: number): void {
+    const rig = this.kumoRigs.get(e.id);
     if (!rig) return;
     const moving = dx !== 0 || dy !== 0;
     rig.amp += ((moving ? 1 : 0) - rig.amp) * 0.18;
@@ -288,11 +469,25 @@ export class EntityLayer {
     rig.root.rotation.y = rig.yaw;
     for (const leg of rig.legs) {
       const ph = rig.phase + leg.parity * Math.PI;
-      leg.hip.rotation.y = 0.4 * Math.sin(ph) * rig.amp; // fore-aft swing
-      leg.hip.rotation.z = -leg.side * Math.max(0, Math.cos(ph)) * 0.3 * rig.amp; // step lift
+      if (leg.baseYaw === 0) {
+        leg.hip.rotation.y = 0.3 * Math.sin(ph) * rig.amp; // middle legs: symmetric fore-aft swing
+      } else {
+        // splayed rest pose is the yaw limit — the stride folds in from it, never past
+        leg.hip.rotation.y = leg.baseYaw - Math.sign(leg.baseYaw) * 0.3 * (0.5 + 0.5 * Math.sin(ph)) * rig.amp;
+      }
+      leg.hip.rotation.z = leg.side * Math.max(0, Math.cos(ph)) * 0.25 * rig.amp; // step lift
     }
     rig.body.position.y = 0.78 + 0.04 * Math.sin(2 * rig.phase) * rig.amp; // scuttle bob
-    rig.head.rotation.y = 0.45 * Math.sin(this.frame * 0.045) * (1 - rig.amp); // idle scan
+
+    // head: turrets track the live target; otherwise scan when idle, eyes front when moving
+    const tgt = e.targetId ? game.entities.get(e.targetId) : undefined;
+    const want = tgt
+      ? Math.atan2(tgt.pos.x - e.pos.x, tgt.pos.y - e.pos.y) - rig.yaw
+      : moving
+        ? 0
+        : 0.45 * Math.sin(this.frame * 0.045);
+    const dh = Math.atan2(Math.sin(want - rig.head.rotation.y), Math.cos(want - rig.head.rotation.y));
+    rig.head.rotation.y += dh * 0.25;
   }
 
   private bar(id: number): THREE.Sprite {
@@ -328,7 +523,9 @@ export class EntityLayer {
       if (e.kind === 'unit') {
         mesh.position.set(x, gy + HOVER[e.type], z);
         if (e.type === 'wasp') mesh.rotation.y += 0.05;
-        if (e.type === 'kumo') this.animateKumo(e.id, e.pos.x - prev.x, e.pos.y - prev.y);
+        if (e.type === 'kumo') this.animateKumo(e, game, e.pos.x - prev.x, e.pos.y - prev.y);
+        if (e.type === 'kaze') this.animateKaze(e);
+        if (e.type === 'taiko') this.animateTaiko(e, game, e.pos.x - prev.x, e.pos.y - prev.y);
         setEmissive(mesh, this.hitFlash.has(e.id) ? 2.6 : null); // impact glow
       } else if (e.kind === 'commander') {
         mesh.position.set(x, gy + 1.3, z);
@@ -372,6 +569,22 @@ export class EntityLayer {
           mat.wireframe = false;
           mat.emissiveIntensity = this.hitFlash.has(e.id) ? 1.3 : 0.35; // impact glow
           this.dropProgress(e.id);
+          // starved fabricator: red pulse overhead until it releases again
+          if (e.type === 'fabricator' && e.starved && e.player === 0) {
+            let s = this.starveMarks.get(e.id);
+            if (!s) {
+              s = new THREE.Sprite(new THREE.SpriteMaterial({ color: '#ff5050', transparent: true, depthTest: false }));
+              s.renderOrder = 6;
+              this.group.add(s);
+              this.starveMarks.set(e.id, s);
+            }
+            s.position.set(x, gy + lift + 2.6, z);
+            const pulse = 0.55 + 0.45 * Math.sin(this.frame * 0.18);
+            s.scale.set(0.55, 0.55, 1);
+            (s.material as THREE.SpriteMaterial).opacity = pulse;
+          } else {
+            this.dropStarveMark(e.id);
+          }
         } else {
           const frac = e.buildTicksNeeded > 0 ? Math.min(1, e.buildTicks / e.buildTicksNeeded) : 1;
           mesh.scale.y = 0.15 + 0.85 * frac;
@@ -404,6 +617,8 @@ export class EntityLayer {
           if (o instanceof THREE.Mesh) o.geometry.dispose();
         });
         this.kumoRigs.delete(id);
+        this.kazeRigs.delete(id);
+        this.taikoRigs.delete(id);
         this.meshes.delete(id);
         const s = this.bars.get(id);
         if (s) {
@@ -411,6 +626,7 @@ export class EntityLayer {
           this.bars.delete(id);
         }
         this.dropProgress(id);
+        this.dropStarveMark(id);
         this.dropBeam(id);
       }
     }
@@ -437,11 +653,14 @@ export class EntityLayer {
       this.selRing.visible = false;
     }
 
-    // attack tracers: consume the sim's per-tick attack log once per tick
+    // attack tracers + artillery events: consume the sim's per-tick logs once per tick
     if (game.tick !== this.lastAttackTick) {
       this.lastAttackTick = game.tick;
       for (const a of game.attackLog) this.spawnShot(a);
+      for (const s of game.shellLog) this.onShellFired(s);
+      for (const b of game.burstLog) this.onAirburst(b);
     }
+    this.updateShells(game, alpha);
     this.animateShots();
 
     this.updateGhosts(game);
@@ -454,7 +673,9 @@ export class EntityLayer {
     const ca = posToCell(a.from);
     const cb = posToCell(a.to);
     if (!this.terrain.isVisible(ca.cx, ca.cy) && !this.terrain.isVisible(cb.cx, cb.cy)) return;
-    const muzzleH = a.attackerType === 'watchtower' ? 3.6 : 1.0;
+    // artillery attacks originate at the airburst, not a muzzle: fast flak shards down to each victim
+    const arty = a.attackerType !== 'watchtower' && UNIT_STATS[a.attackerType].windupTicks !== undefined;
+    const muzzleH = a.attackerType === 'watchtower' ? 3.6 : arty ? BURST_H : 1.0;
     const from = new THREE.Vector3(
       a.from.x / FP,
       this.terrain.heightAtMu(a.from.x, a.from.y) + muzzleH,
@@ -490,7 +711,8 @@ export class EntityLayer {
       return;
     }
 
-    const mesh = new THREE.Mesh(SHOT_GEO, SHOT_MAT[a.player]);
+    const mesh = new THREE.Mesh(SHOT_GEO, arty ? SHELL_MAT : SHOT_MAT[a.player]);
+    if (arty) mesh.scale.set(0.4, 0.4, 0.9);
     mesh.position.copy(from);
     this.group.add(mesh);
     this.shots.push({
@@ -498,11 +720,103 @@ export class EntityLayer {
       from,
       to,
       age: 0,
-      life: Math.max(3, Math.round(from.distanceTo(to) / 2.2)),
+      life: arty ? Math.max(2, Math.round(from.distanceTo(to) / 6)) : Math.max(3, Math.round(from.distanceTo(to) / 2.2)),
       delay: 0,
       targetId: a.targetId,
-      impact: 0.5,
+      impact: arty ? 0.3 : 0.5,
     });
+  }
+
+  /** Muzzle flash + recoil kick on the firing taiko (the shell itself renders from game.shells). */
+  private onShellFired(s: ShellEvent): void {
+    const c = posToCell(s.from);
+    if (!this.terrain.isVisible(c.cx, c.cy)) return;
+    const rig = this.taikoRigs.get(s.attackerId);
+    if (rig) {
+      rig.recoil = 0.4;
+      const p = new THREE.Vector3();
+      rig.muzzle.getWorldPosition(p);
+      this.spawnFlash(p, 5, 0.6, '#ffe9a0');
+    } else {
+      // firer's mesh is fog-culled: flash where the shot left the ground anyway
+      this.spawnFlash(
+        new THREE.Vector3(s.from.x / FP, this.terrain.heightAtMu(s.from.x, s.from.y) + 1.6, s.from.y / FP),
+        5,
+        0.6,
+        '#ffe9a0',
+      );
+    }
+  }
+
+  /** Airburst: flash well above the impact point, flak streaking down into the area. */
+  private onAirburst(b: BurstEvent): void {
+    const c = posToCell(b.pos);
+    if (!this.terrain.isVisible(c.cx, c.cy)) return;
+    const gy = this.terrain.heightAtMu(b.pos.x, b.pos.y);
+    const center = new THREE.Vector3(b.pos.x / FP, gy + BURST_H, b.pos.y / FP);
+    this.spawnFlash(center, 10, 1.9, '#ffd9a0');
+    this.spawnFlash(center, 5, 1.0, '#ffffff');
+    // cosmetic flak shower: short tracers from the burst to random ground points in the splash
+    const r = b.splashMu / FP;
+    for (let i = 0; i < 10; i++) {
+      const ang = Math.random() * Math.PI * 2;
+      const rad = r * Math.sqrt(Math.random());
+      const to = new THREE.Vector3(
+        b.pos.x / FP + Math.cos(ang) * rad,
+        gy + 0.15,
+        b.pos.y / FP + Math.sin(ang) * rad,
+      );
+      const mesh = new THREE.Mesh(SHOT_GEO, SHELL_MAT);
+      mesh.scale.set(0.3, 0.3, 0.8);
+      mesh.position.copy(center);
+      this.group.add(mesh);
+      this.shots.push({
+        mesh,
+        from: center.clone(),
+        to,
+        age: 0,
+        life: 4 + Math.floor(Math.random() * 4),
+        delay: 0,
+        targetId: 0, // no entity: just an impact spark where it lands
+        impact: 0.18,
+      });
+    }
+  }
+
+  /** Arcing shell meshes driven directly by live sim projectiles — always lands in sync with the burst. */
+  private updateShells(game: Game, alpha: number): void {
+    const live = new Set<ShellState>(game.shells);
+    for (const sh of game.shells) {
+      const ca = posToCell(sh.from);
+      const cb = posToCell(sh.to);
+      let mesh = this.shellMeshes.get(sh);
+      if (!mesh) {
+        mesh = new THREE.Mesh(SHELL_GEO, SHELL_MAT);
+        this.group.add(mesh);
+        this.shellMeshes.set(sh, mesh);
+      }
+      mesh.visible = this.terrain.isVisible(ca.cx, ca.cy) || this.terrain.isVisible(cb.cx, cb.cy);
+      if (!mesh.visible) continue;
+      const t = Math.min(1, (sh.ticksTotal - sh.ticksLeft + alpha) / sh.ticksTotal);
+      const x0 = sh.from.x / FP;
+      const z0 = sh.from.y / FP;
+      const x1 = sh.to.x / FP;
+      const z1 = sh.to.y / FP;
+      const y0 = this.terrain.heightAtMu(sh.from.x, sh.from.y) + 1.1;
+      const y1 = this.terrain.heightAtMu(sh.to.x, sh.to.y) + BURST_H;
+      const arc = Math.min(14, Math.max(2.5, Math.hypot(x1 - x0, z1 - z0) * 0.35));
+      mesh.position.set(
+        x0 + (x1 - x0) * t,
+        y0 + (y1 - y0) * t + arc * 4 * t * (1 - t),
+        z0 + (z1 - z0) * t,
+      );
+    }
+    for (const [sh, mesh] of this.shellMeshes) {
+      if (!live.has(sh)) {
+        this.group.remove(mesh); // geometry/material shared — no dispose
+        this.shellMeshes.delete(sh);
+      }
+    }
   }
 
   private spawnFlash(pos: THREE.Vector3, life: number, size: number, color: string): void {
@@ -588,6 +902,14 @@ export class EntityLayer {
     if (!p) return;
     this.group.remove(p.bg, p.fill);
     this.progress.delete(id);
+  }
+
+  private dropStarveMark(id: number): void {
+    const s = this.starveMarks.get(id);
+    if (!s) return;
+    this.group.remove(s);
+    s.material.dispose();
+    this.starveMarks.delete(id);
   }
 
   /** Crackling energy beam from a channeling Commander to its work site. */

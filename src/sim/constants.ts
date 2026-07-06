@@ -10,7 +10,7 @@ export const FP = 1000; // fixed-point scale for world units
 export const MAP_SIZE = 180; // world units, square
 export const STARTING_ENERGY = 200 * 1000; // me
 
-export type UnitType = 'ronin' | 'oni' | 'mantis' | 'wasp' | 'kumo';
+export type UnitType = 'ronin' | 'oni' | 'mantis' | 'wasp' | 'kumo' | 'kaze' | 'taiko';
 export type BuildingType =
   | 'bastion'
   | 'extractor'
@@ -20,8 +20,7 @@ export type BuildingType =
   | 'aegis_projector';
 
 export interface UnitStats {
-  cost: number; // e
-  buildTime: number; // s
+  cost: number; // e — units insta-build on the wave cycle; energy is the only throttle
   hp: number; // HP
   dps: number; // HP/s
   range: number; // u
@@ -29,25 +28,48 @@ export interface UnitStats {
   speed: number; // u/s
   vision: number; // u
   burstTicks?: number; // fires one volley every N ticks, dps preserved (default 1 = every tick)
+  radius?: number; // u — body radius for separation/flocking (default 0.4)
+  // Vehicle kinematics — defining accel makes the unit drive instead of walk:
+  // it accelerates/brakes, turns at a speed-limited rate, and skirmishes
+  // (orbits its target while firing) instead of standing to shoot.
+  accel?: number; // u/s^2
+  decel?: number; // u/s^2 (braking)
+  turnRate?: number; // deg/s at standstill
+  turnRateMin?: number; // deg/s at max speed (faster = wider arcs)
+  // Artillery — defining these makes the unit lob airburst shells instead of
+  // direct fire: it must raise its barrel (windup) before it can shoot, and
+  // each shell flies to where the target WAS at fire time, then bursts above
+  // the ground, hitting everything in the splash radius (even cloaked).
+  windupTicks?: number; // ticks of barrel-raise before the first shot (lowers at half rate)
+  splashRadius?: number; // u — airburst flak radius around the impact point
+  shellSpeed?: number; // u/s — projectile flight speed
 }
 
 export const UNIT_STATS: Record<UnitType, UnitStats> = {
-  ronin: { cost: 50, buildTime: 15, hp: 120, dps: 12, range: 8, minRange: 0, speed: 5.5, vision: 12 },
-  oni: { cost: 120, buildTime: 35, hp: 400, dps: 20, range: 10, minRange: 0, speed: 3.5, vision: 10 },
-  mantis: { cost: 100, buildTime: 30, hp: 90, dps: 25, range: 22, minRange: 6, speed: 3.0, vision: 10 },
-  wasp: { cost: 40, buildTime: 12, hp: 60, dps: 8, range: 6, minRange: 0, speed: 8.0, vision: 14 },
-  kumo: { cost: 80, buildTime: 22, hp: 150, dps: 16, range: 12, minRange: 0, speed: 4.5, vision: 12, burstTicks: 8 },
+  ronin: { cost: 50, hp: 120, dps: 12, range: 8, minRange: 0, speed: 5.5, vision: 12, radius: 0.4 },
+  oni: { cost: 120, hp: 400, dps: 20, range: 10, minRange: 0, speed: 3.5, vision: 10, radius: 0.75 },
+  mantis: { cost: 100, hp: 90, dps: 25, range: 22, minRange: 6, speed: 3.0, vision: 10, radius: 0.35 },
+  wasp: { cost: 40, hp: 60, dps: 8, range: 6, minRange: 0, speed: 8.0, vision: 14, radius: 0.3 },
+  kumo: { cost: 80, hp: 150, dps: 16, range: 12, minRange: 0, speed: 4.5, vision: 12, burstTicks: 8, radius: 0.8 },
+  kaze: { cost: 60, hp: 80, dps: 10, range: 7, minRange: 0, speed: 10.0, vision: 13,
+    accel: 5, decel: 12, turnRate: 300, turnRateMin: 70, radius: 0.5 },
+  taiko: { cost: 140, hp: 130, dps: 14, range: 28, minRange: 9, speed: 2.2, vision: 11,
+    burstTicks: 40, radius: 0.7, windupTicks: 20, splashRadius: 3.5, shellSpeed: 14 },
 };
 
 // Counter multipliers, per-mille, attacker -> defender. Buildings and the
 // Commander use the 'building'/'commander' columns.
 export const COUNTER: Record<UnitType, Record<UnitType | 'building' | 'commander', number>> = {
-  ronin: { ronin: 1000, oni: 600, mantis: 1500, wasp: 1200, kumo: 800, building: 800, commander: 1000 },
-  oni: { ronin: 1500, oni: 1000, mantis: 800, wasp: 800, kumo: 1400, building: 1200, commander: 1000 },
-  mantis: { ronin: 800, oni: 1500, mantis: 1000, wasp: 500, kumo: 1200, building: 1500, commander: 1000 },
-  wasp: { ronin: 700, oni: 500, mantis: 1000, wasp: 1000, kumo: 700, building: 1500, commander: 1000 },
+  ronin: { ronin: 1000, oni: 600, mantis: 1500, wasp: 1200, kumo: 800, kaze: 1000, taiko: 1100, building: 800, commander: 1000 },
+  oni: { ronin: 1500, oni: 1000, mantis: 800, wasp: 800, kumo: 1400, kaze: 800, taiko: 700, building: 1200, commander: 1000 },
+  mantis: { ronin: 800, oni: 1500, mantis: 1000, wasp: 500, kumo: 1200, kaze: 700, taiko: 800, building: 1500, commander: 1000 },
+  wasp: { ronin: 700, oni: 500, mantis: 1000, wasp: 1000, kumo: 700, kaze: 1000, taiko: 1300, building: 1500, commander: 1000 },
   // light spider tank: twin LMGs shred light units, useless into armor/structures
-  kumo: { ronin: 1400, oni: 600, mantis: 1100, wasp: 1400, kumo: 1000, building: 600, commander: 1000 },
+  kumo: { ronin: 1400, oni: 600, mantis: 1100, wasp: 1400, kumo: 1000, kaze: 1400, taiko: 1200, building: 600, commander: 1000 },
+  // skirmish bike: runs down artillery and raiders, melts if it drives into guns
+  kaze: { ronin: 900, oni: 700, mantis: 1400, wasp: 1100, kumo: 700, kaze: 1000, taiko: 1500, building: 700, commander: 1000 },
+  // siege artillery: airburst flak wrecks big slow hulls and structures; fast movers dodge the falling shells
+  taiko: { ronin: 900, oni: 1300, mantis: 1200, wasp: 500, kumo: 1100, kaze: 400, taiko: 1000, building: 1600, commander: 1000 },
 };
 
 export interface BuildingStats {
@@ -62,7 +84,17 @@ export interface BuildingStats {
 }
 
 /** All fabricators release finished units together on this shared cycle (s). */
-export const WAVE_INTERVAL = 10;
+export let WAVE_INTERVAL = 10;
+/** Debug tuning hook — the sim reads WAVE_INTERVAL every tick, so this applies live. */
+export function setWaveInterval(s: number): void {
+  WAVE_INTERVAL = Math.max(1, Math.round(s));
+}
+
+// Assault cohesion: en route to rally, units pace themselves to the group's
+// slowest member so mixed comps arrive together instead of trickling in.
+export const COHESION_RADIUS = 9; // u — groupmates considered within this range
+export const COHESION_SLACK = 1.5; // u — how far ahead of the pack a unit may run free
+export const COHESION_BREAK_RANGE = 15; // u — a visible enemy this close releases the formation
 
 export const BUILDING_STATS: Record<BuildingType, BuildingStats> = {
   bastion: { cost: 0, buildTime: 0, hp: 1500, footprint: 6, vision: 12 },
@@ -169,6 +201,13 @@ export const GUARD_ENGAGE_RADIUS = 15; // u from rally
 export const GUARD_CHASE_LEASH = 10; // u past engage radius
 
 export type OverrideStance = 'fall_back' | 'defend' | 'release';
+
+// Kiting (min-range units backing off a close threat): retreat runs back down
+// the unit's advance lane — the segment from its home anchor (source
+// fabricator, else bastion) to its rally — and may not wander further than
+// this to the side of it. Stops orbiting chasers herding units to map edges.
+export const KITE_CORRIDOR = 10; // u — max lateral offset from the lane while kiting
+export const KITE_LANE_BACKSTEP = 5; // u — how far down-lane the retreat point sits
 
 // Vision recompute cadence (ticks)
 export const VISION_INTERVAL = 5;

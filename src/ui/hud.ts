@@ -31,7 +31,7 @@ const BUILDABLE: { type: BuildingType; key: string; label: string }[] = [
   { type: 'sensor_spire', key: '4', label: 'spire' },
   { type: 'aegis_projector', key: '5', label: 'aegis' },
 ];
-const UNIT_ORDER: UnitType[] = ['ronin', 'oni', 'mantis', 'wasp', 'kumo'];
+const UNIT_ORDER: UnitType[] = ['ronin', 'oni', 'mantis', 'wasp', 'kumo', 'kaze', 'taiko'];
 const BEHAVIORS: Behavior[] = ['guard', 'assault', 'hold', 'hunt'];
 
 /** Native-tooltip text for a producible unit: stats + counter relationships. */
@@ -42,8 +42,11 @@ function unitTooltip(u: UnitType): string {
     .map((k) => (k === 'building' ? 'buildings' : k));
   const counteredBy = UNIT_ORDER.filter((o) => o !== u && COUNTER[o][u] >= 1200);
   return [
-    `${u} — ${s.cost}e · ${s.buildTime}s build`,
+    `${u} — ${s.cost}e · insta-builds on the wave`,
     `${s.hp}hp · ${s.dps}dps · range ${s.minRange ? `${s.minRange}–` : ''}${s.range} · speed ${s.speed} · vision ${s.vision}`,
+    ...(s.windupTicks
+      ? [`artillery: airburst splash r${s.splashRadius} · ${s.windupTicks / 10}s barrel-raise · shells land where the target was`]
+      : []),
     `strong vs: ${strong.join(', ') || '—'}`,
     `countered by: ${counteredBy.join(', ') || '—'}`,
   ].join('\n');
@@ -279,20 +282,20 @@ export class Hud {
           ? `queued (${taskIdx + 1} in line)`
           : 'PAUSED';
 
-    // Fabricator bay status: producing / holding for the wave / starved / off.
+    // Fabricator wave status: releasing / short on energy / starved last wave / off.
     const waveTicks = WAVE_INTERVAL * TICKS_PER_SECOND;
     const waveEta = Math.ceil((waveTicks - (this.game.tick % waveTicks)) / TICKS_PER_SECOND);
-    const prodState = b.ready !== null ? 'ready' : b.prodTicksLeft >= 0 ? 'prod' : b.on ? 'wait' : 'off';
+    const unitCost = UNIT_STATS[b.production].cost;
+    const canAfford = this.game.players[0].energy >= unitCost * FP;
+    const prodState = !b.on ? 'off' : b.starved ? 'starved' : canAfford ? 'ok' : 'short';
     const prodText =
       b.type !== 'fabricator' || !b.done
         ? ''
-        : b.ready !== null
-          ? `▶ ${b.ready} ready — deploys with wave in ${waveEta}s`
-          : b.prodTicksLeft >= 0
-            ? `⚙ building ${b.production} — ${Math.ceil(b.prodTicksLeft / TICKS_PER_SECOND)}s`
-            : b.on
-              ? 'awaiting energy…'
-              : 'production off';
+        : !b.on
+          ? 'production off'
+          : b.starved
+            ? `▲ skipped last wave — needs ${unitCost}e (older fabricators fund first)`
+            : `${b.production} (${unitCost}e) deploys with wave in ${waveEta}s${canAfford ? '' : ' — ⚠ low energy'}`;
 
     // Re-render only when the displayed state changes (keeps buttons clickable).
     const key = JSON.stringify([

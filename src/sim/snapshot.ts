@@ -68,8 +68,7 @@ export function snapshot(game: Game, player: PlayerId, decisionInterval = 10): o
       entry.on = b.on;
       entry.rally = posOut(b.rally);
       entry.behavior = b.behavior;
-      entry.producing = b.prodTicksLeft >= 0;
-      if (b.ready !== null) entry.readyForWave = b.ready;
+      if (b.starved) entry.skippedLastWave = true;
     }
     myBuildings.push(entry);
   }
