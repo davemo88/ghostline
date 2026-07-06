@@ -11,7 +11,9 @@
     "test:watch": "vitest",
     "cvc": "vite-node scripts/cvc.ts",
     "balance": "vite-node scripts/balance.ts",
-    "replay": "vite-node scripts/replay.ts"
+    "replay": "vite-node scripts/replay.ts",
+    "deploy": "netlify deploy",
+    "deploy:prod": "netlify deploy --prod"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.110.0",

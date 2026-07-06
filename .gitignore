@@ -4,3 +4,6 @@ replays/
 *.log
 .DS_Store
 .claude/settings.local.json
+
+# Local Netlify folder
+.netlify

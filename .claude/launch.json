@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "ghostline-dev",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--", "--port=5199", "--strictPort"],
+      "port": 5199
+    },
+    {
+      "name": "ghostline-dev-2",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--", "--port=5198", "--strictPort"],
+      "port": 5198
+    }
+  ]
+}
